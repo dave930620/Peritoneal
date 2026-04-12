@@ -1,0 +1,23 @@
+# Core ML
+torch>=2.0.0
+scikit-learn>=1.3.0
+catboost>=1.2.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0      # for reading .xlsx files
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Baselines (new)
+xgboost>=2.0.0
+pytorch-tabnet>=4.1.0    # TabNet (B6)
+
+# Interpretability (new)
+shap>=0.44.0
+
+# Statistics (new)
+scipy>=1.11.0            # Wilcoxon test, bootstrap CI
