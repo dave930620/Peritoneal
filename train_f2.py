@@ -156,6 +156,17 @@ def predict_f1_from_z_batch(
     f1_model: nn.Module,
 ) -> torch.Tensor:
     """Differentiable F1 call: write F2's Rx into the standardized feature vector."""
+    scaler     = feature_info["scaler"]
+    cont_names = feature_info["continuous_feature_names"]
+
+    # Clamp in z-space so de-standardized Rx >= 0 (consistent with inference)
+    z_min_vals = [-(scaler.mean_[cont_names.index(col)] /
+                    max(float(scaler.scale_[cont_names.index(col)]), 1e-8))
+                  for col in CONT_RX]
+    z_min_t = torch.tensor(z_min_vals, device=z_cont_pred.device,
+                           dtype=z_cont_pred.dtype)
+    z_cont_pred = torch.clamp(z_cont_pred, min=z_min_t)
+
     orig_features = feature_info["original_feature_names"]
     Xstd = x_std.clone().float()
     for j, col in enumerate(CONT_RX):
@@ -434,6 +445,14 @@ def infer_prescriptions(
             d   = z_np[r] - z_doc[r]
             n   = np.linalg.norm(d)
             z_proj[r] = z_np[r] if (n == 0 or n <= eps) else z_doc[r] + d * (eps / n)
+
+        # Clamp in z-space: ensures de-standardized raw >= 0 for all Rx variables
+        z_min = np.array([
+            -(scaler.mean_[cont_names.index(col)] /
+              max(float(scaler.scale_[cont_names.index(col)]), 1e-8))
+            for col in CONT_RX
+        ], dtype=np.float32)
+        z_proj = np.maximum(z_proj, z_min)
 
         # De-standardize + round to clinical step sizes
         for r in range(z_proj.shape[0]):

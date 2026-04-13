@@ -119,7 +119,7 @@ def baseline_stage_A(df_train, df_val, df_test, feature_info, f1_model, device) 
     for i in range(len(df_test)):
         row = {CAT_RX: int(te_preds["cat"][i])}
         for j, col in enumerate(CONT_RX):
-            raw  = float(te_preds["cont"][i, j])
+            raw  = max(0.0, float(te_preds["cont"][i, j]))  # enforce non-negativity
             step = STEP_MAP[col]
             row[col] = float(np.round(raw / step) * step)
         rows.append(row)
@@ -188,6 +188,7 @@ def baseline_random_search(df_test, feature_info, f1_model, device,
                 x[orig_features.index(col)] = z_raw
                 idx  = cont_names.index(col)
                 raw  = z_raw * scaler.scale_[idx] + scaler.mean_[idx]
+                raw  = max(0.0, raw)          # enforce non-negativity (Rx must be ≥ 0)
                 step = STEP_MAP[col]
                 row[col] = float(np.round(raw / step) * step)
             cands.append((x.copy(), row))

@@ -100,6 +100,25 @@ def make_cfg(overrides: Optional[dict] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Non-negativity helpers
+# ---------------------------------------------------------------------------
+
+def _compute_z_min(feature_info: dict) -> np.ndarray:
+    """
+    Minimum valid z-value per CONT_RX column such that de-standardizing gives raw >= 0.
+    z_min[j] = (0 - mean) / scale  (raw=0 maps to this z-score)
+    """
+    scaler     = feature_info["scaler"]
+    cont_names = feature_info["continuous_feature_names"]
+    z_min = np.zeros(len(CONT_RX), dtype=np.float32)
+    for j, col in enumerate(CONT_RX):
+        idx = cont_names.index(col)
+        sd  = scaler.scale_[idx] if scaler.scale_[idx] > 0 else 1.0
+        z_min[j] = -scaler.mean_[idx] / sd
+    return z_min
+
+
+# ---------------------------------------------------------------------------
 # Stage A helpers (same logic as train_f2.py)
 # ---------------------------------------------------------------------------
 
@@ -187,6 +206,11 @@ def _stage_b_loss(z_pred, logit, xb, yb_cont, yb_cat, yb_doc_hat,
                   f1_model, feature_info, step, total_steps, cfg) -> torch.Tensor:
     orig_features = feature_info["original_feature_names"]
     p_now = torch.softmax(logit, dim=1)
+
+    # Clamp z_pred to valid z-space so raw Rx >= 0 (consistent with inference)
+    z_min_np = _compute_z_min(feature_info)
+    z_min_t  = torch.tensor(z_min_np, device=z_pred.device, dtype=z_pred.dtype)
+    z_pred   = torch.clamp(z_pred, min=z_min_t)
 
     # F1 prediction with F2's Rx patched in
     Xstd  = xb.clone().float()
@@ -342,6 +366,10 @@ def infer_prescriptions(
                 n   = np.linalg.norm(d)
                 if n > 0 and n > eps:
                     z_proj[r] = z_doc[r] + d * (eps / n)
+
+        # Clamp in z-space: ensures de-standardized raw >= 0 for all Rx variables
+        z_min = _compute_z_min(feature_info)   # shape (len(CONT_RX),)
+        z_proj = np.maximum(z_proj, z_min)
 
         for r in range(z_proj.shape[0]):
             row = {CAT_RX: int(cat_idx[r])}
