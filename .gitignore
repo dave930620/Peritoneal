@@ -1,0 +1,31 @@
+# Model checkpoints & artifacts
+saint_pd_model.pth
+feature_info.pkl
+report_model2/
+catboost_models/
+catboost_info/
+
+# Experiment results
+results/f1/*.json
+results/f2/*.json
+results/f2/checkpoints/
+results/figures/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
