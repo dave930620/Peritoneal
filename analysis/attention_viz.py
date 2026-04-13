@@ -56,7 +56,8 @@ def load_model_and_data():
     y_test = y[te_idx]
 
     from src.models.saint import SAINT
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from src.utils.device import get_device
+    device = get_device()
     model  = SAINT(
         input_size=X.shape[1], hidden_size=F1_HIDDEN_SIZE,
         output_size=F1_OUTPUT_SIZE,

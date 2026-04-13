@@ -201,7 +201,9 @@ def plot_summary_table(cases: list, save_path: str):
 
 def main():
     Path(FIG_DIR).mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from src.utils.device import get_device, print_device_info
+    device = get_device()
+    print_device_info(device)
 
     print("Loading data ...")
     df_raw       = pd.read_csv(DATA_CSV)

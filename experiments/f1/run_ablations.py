@@ -124,8 +124,9 @@ def main():
     y_train, y_test = y[tr_idx], y[te_idx]
     print(f"Train: {X_train.shape}  Test: {X_test.shape}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    from src.utils.device import get_device, print_device_info
+    device = get_device()
+    print_device_info(device)
 
     for abl_id, desc, model_kw, train_kw in ABLATIONS:
         if result_exists(RESULTS_PATH, abl_id):

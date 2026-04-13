@@ -26,6 +26,7 @@ from src.config import (
 )
 from src.data.preprocessor import load_feature_info, standardize_like_f1
 from src.models.f1_baselines import BASELINE_ORDER, get_f1_baseline
+from src.utils.device import get_device
 from src.utils.metrics import full_f1_metrics
 from src.utils.results_io import save_result, load_results
 
@@ -34,12 +35,21 @@ N_FOLDS      = 5
 METRIC_KEYS  = ["mae", "rmse", "r2", "pearson", "auroc", "auprc",
                 "accuracy", "sensitivity", "specificity", "f1_cls"]
 
+# Models to skip in kfold (too slow; they are still run in run_baselines.py).
+# Remove a name from this list if you want to include it.
+SKIP_IN_KFOLD = {"ft_transformer"}  # TabNet is fine; FT-Transformer is very slow
 
-def _saint_fold(X_tr, y_tr, X_va, y_va, fi):
+# Per-model epoch override for kfold (fewer than the default to save time).
+KFOLD_EPOCHS = {
+    "tabnet":         100,   # default 200 → 100
+    "ft_transformer":  50,   # default 200 → 50 (if not skipped)
+}
+
+
+def _saint_fold(X_tr, y_tr, X_va, y_va, fi, device):
     from src.models.saint import SAINT
     from src.training.f1_core import train_f1_model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = SAINT(
+    model = SAINT(
         input_size=X_tr.shape[1],
         hidden_size=F1_HIDDEN_SIZE, output_size=F1_OUTPUT_SIZE,
         discrete_feature_indices=fi["discrete_feature_indices"],
@@ -54,10 +64,18 @@ def _saint_fold(X_tr, y_tr, X_va, y_va, fi):
     )
 
 
-def run_model_kfold(name, X, y, patient_ids, fi) -> dict:
+def run_model_kfold(name, X, y, patient_ids, fi, device) -> dict:
     """Run N_FOLDS for one model; return aggregated result dict."""
-    gkf    = GroupKFold(n_splits=N_FOLDS)
-    folds  = []
+    gkf   = GroupKFold(n_splits=N_FOLDS)
+    folds = []
+
+    # Per-model kwargs overrides
+    extra_kw = {}
+    raw_name = name.lower().replace(" ", "_")
+    if raw_name in KFOLD_EPOCHS:
+        extra_kw["max_epochs" if raw_name == "tabnet" else "epochs"] = \
+            KFOLD_EPOCHS[raw_name]
+
     for fold, (tr_idx, va_idx) in enumerate(
             gkf.split(X, y, groups=patient_ids), 1):
         print(f"  Fold {fold}/{N_FOLDS} ...", end=" ", flush=True)
@@ -65,10 +83,10 @@ def run_model_kfold(name, X, y, patient_ids, fi) -> dict:
         y_tr, y_va = y[tr_idx], y[va_idx]
 
         if name == "SAINT (ours)":
-            metrics = _saint_fold(X_tr, y_tr, X_va, y_va, fi)
+            metrics = _saint_fold(X_tr, y_tr, X_va, y_va, fi, device)
         else:
             try:
-                model   = get_f1_baseline(name)
+                model   = get_f1_baseline(raw_name, **extra_kw)
                 model.fit(X_tr, y_tr)
                 preds   = model.predict(X_va)
                 metrics = full_f1_metrics(y_va, preds, CLINICAL_THRESHOLD)
@@ -89,6 +107,10 @@ def run_model_kfold(name, X, y, patient_ids, fi) -> dict:
 
 
 def main():
+    device = get_device()
+    print(f"[Device] {device}" +
+          (f" — {torch.cuda.get_device_name(0)}" if device.type == "cuda" else ""))
+
     print(f"Loading {DATA_CSV} ...")
     df          = pd.read_csv(DATA_CSV)
     fi          = load_feature_info(FEATURE_INFO_PATH)
@@ -96,17 +118,25 @@ def main():
     y           = df[OUTCOME_COL].values.astype(np.float32)
     patient_ids = df[PATIENT_ID_COL].values
 
-    existing = load_results(RESULTS_PATH)
-    all_models = ["SAINT (ours)"] + [n.replace("_", " ").title() for n in BASELINE_ORDER]
+    existing   = load_results(RESULTS_PATH)
+    all_models = ["SAINT (ours)"] + [n.replace("_", " ").title()
+                                     for n in BASELINE_ORDER]
 
     for display in all_models:
+        raw = (display if display == "SAINT (ours)"
+               else display.lower().replace(" ", "_"))
+
+        if raw in SKIP_IN_KFOLD:
+            print(f"[skip-kfold] {display} is in SKIP_IN_KFOLD "
+                  f"(too slow; single-split result in baselines.json).")
+            continue
+
         if display in existing:
             print(f"[skip] {display} already in results.")
             continue
+
         print(f"\n=== {display} ===")
-        name = (display if display == "SAINT (ours)"
-                else display.lower().replace(" ", "_"))
-        result = run_model_kfold(name, X, y, patient_ids, fi)
+        result = run_model_kfold(display, X, y, patient_ids, fi, device)
         save_result(RESULTS_PATH, display, result)
         print(f"  → mae={result['mae_mean']:.3f}±{result['mae_std']:.3f}  "
               f"auroc={result['auroc_mean']:.3f}±{result['auroc_std']:.3f}")

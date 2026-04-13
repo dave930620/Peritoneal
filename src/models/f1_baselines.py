@@ -79,13 +79,18 @@ class XGBoostBaseline(_BaselineWrapper):
                  max_depth: int = 6, random_state: int = 42):
         try:
             import xgboost as xgb
+            import torch
         except ImportError:
             raise ImportError("pip install xgboost")
+        use_cuda = torch.cuda.is_available()
         self._model = xgb.XGBRegressor(
             n_estimators=n_estimators, learning_rate=learning_rate,
             max_depth=max_depth, random_state=random_state,
             n_jobs=-1, verbosity=0,
+            device="cuda" if use_cuda else "cpu",
         )
+        if use_cuda:
+            print("[XGBoost] Using GPU (CUDA)")
 
     def fit(self, X, y):
         self._model.fit(X, y); return self
@@ -103,12 +108,17 @@ class CatBoostBaseline(_BaselineWrapper):
                  depth: int = 6, random_seed: int = 42):
         try:
             from catboost import CatBoostRegressor
+            import torch
         except ImportError:
             raise ImportError("pip install catboost")
+        use_cuda = torch.cuda.is_available()
         self._model = CatBoostRegressor(
             iterations=iterations, learning_rate=learning_rate,
             depth=depth, random_seed=random_seed, verbose=0,
+            task_type="GPU" if use_cuda else "CPU",
         )
+        if use_cuda:
+            print("[CatBoost] Using GPU (CUDA)")
 
     def fit(self, X, y):
         self._model.fit(X, y); return self
@@ -153,9 +163,13 @@ class TabNetBaseline(_BaselineWrapper):
             from pytorch_tabnet.tab_model import TabNetRegressor
         except ImportError:
             raise ImportError("pip install pytorch-tabnet")
+        import torch
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            print("[TabNet] Using GPU (CUDA)")
         self._cls   = TabNetRegressor
         self._kw    = dict(n_d=n_d, n_a=n_a, n_steps=n_steps,
-                          seed=seed, verbose=0)
+                          seed=seed, verbose=0, device_name=device_name)
         self._fit_kw = dict(max_epochs=max_epochs, patience=patience,
                             batch_size=256, virtual_batch_size=128)
         self._model  = None
@@ -263,9 +277,10 @@ class FTTransformerBaseline(_BaselineWrapper):
         import torch.nn as nn
         import torch.optim as optim
         from torch.utils.data import DataLoader, TensorDataset
+        from src.utils.device import get_device
 
         torch.manual_seed(self._seed)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
 
         n_features = X.shape[1]
         self._net  = _FTTransformerNet(n_features, **self._kw)

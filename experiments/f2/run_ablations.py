@@ -99,8 +99,9 @@ def load_f1(feature_info, device):
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    from src.utils.device import get_device, print_device_info
+    device = get_device()
+    print_device_info(device)
 
     print(f"Loading {DATA_CSV} ...")
     df_raw       = pd.read_csv(DATA_CSV)

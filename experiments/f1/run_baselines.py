@@ -56,7 +56,8 @@ def load_data_split():
 def eval_saint(X_test, y_test, feature_info):
     """Evaluate the saved SAINT model from train_f1.py on the test set."""
     from src.models.saint import SAINT
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from src.utils.device import get_device
+    device = get_device()
     fi = feature_info
 
     model = SAINT(
