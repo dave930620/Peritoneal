@@ -57,6 +57,7 @@ from src.data.preprocessor import (
     RxDataset, standardize_like_f1, validate_columns,
 )
 from src.models.f2_head import F2RxHead
+from src.models.stage_b_models import build_stage_b
 from src.utils.metrics import f2_metrics, pearson_correlation
 
 
@@ -119,7 +120,7 @@ def _compute_z_min(feature_info: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Stage A helpers (same logic as train_f2.py)
+# Stage A helpers
 # ---------------------------------------------------------------------------
 
 def _patient_feature_cols(feature_info: dict) -> list:
@@ -127,47 +128,256 @@ def _patient_feature_cols(feature_info: dict) -> list:
     return [c for c in feature_info["original_feature_names"] if c not in rx_cols]
 
 
-def train_stage_A(df_tr, df_va, feature_info: dict, save_dir: str = "") -> dict:
-    try:
-        from catboost import CatBoostClassifier, CatBoostRegressor
-    except ImportError:
-        raise ImportError("pip install catboost")
-
+def _get_patient_Xstd(df, feature_info: dict) -> np.ndarray:
+    """Standardized patient features (Rx columns excluded), for DL Stage A."""
     patient_cols = _patient_feature_cols(feature_info)
-    X_tr, X_va  = df_tr[patient_cols], df_va[patient_cols]
+    Xstd = standardize_like_f1(df, feature_info)
+    return Xstd[patient_cols].values.astype(np.float32)
+
+
+def _get_rx_z_targets(df, feature_info: dict):
+    """Doctor Rx as z-scored targets for DL Stage A training."""
+    scaler     = feature_info["scaler"]
+    cont_names = feature_info["continuous_feature_names"]
+    y_cont = np.zeros((len(df), len(CONT_RX)), dtype=np.float32)
+    for j, col in enumerate(CONT_RX):
+        idx = cont_names.index(col)
+        mu  = scaler.mean_[idx]
+        sd  = scaler.scale_[idx] if scaler.scale_[idx] > 0 else 1.0
+        y_cont[:, j] = (df[col].values.astype(np.float32) - mu) / sd
+    y_cat = df[CAT_RX].astype(int).values
+    return y_cont, y_cat
+
+
+def _train_stage_A_nn(df_tr, df_va, feature_info: dict,
+                      nn_model: nn.Module, device: torch.device,
+                      epochs: int = 150, lr: float = 1e-3,
+                      batch_size: int = 256) -> nn.Module:
+    """Train a multi-task NN Stage A model.
+
+    Targets are z-scored Rx values (consistent with Stage B's z-space).
+    Loss = MSE (continuous) + CrossEntropy (categorical).
+    """
+    from torch.utils.data import TensorDataset, DataLoader as DL
+
+    X_tr, (yc_tr, yk_tr) = _get_patient_Xstd(df_tr, feature_info), _get_rx_z_targets(df_tr, feature_info)
+    X_va, (yc_va, yk_va) = _get_patient_Xstd(df_va, feature_info), _get_rx_z_targets(df_va, feature_info)
+
+    def _to_tensors(X, yc, yk):
+        return (torch.tensor(X,  dtype=torch.float32, device=device),
+                torch.tensor(yc, dtype=torch.float32, device=device),
+                torch.tensor(yk, dtype=torch.long,    device=device))
+
+    Xt, yct, ykt = _to_tensors(X_tr, yc_tr, yk_tr)
+    Xv, ycv, ykv = _to_tensors(X_va, yc_va, yk_va)
+    ds_tr = TensorDataset(Xt, yct, ykt)
+    dl_tr = DL(ds_tr, batch_size=batch_size, shuffle=True)
+
+    nn_model.to(device)
+    opt = optim.AdamW(nn_model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    best_val, best_sd = float("inf"), None
+
+    for epoch in range(1, epochs + 1):
+        nn_model.train()
+        for xb, ycb, ykb in dl_tr:
+            opt.zero_grad(set_to_none=True)
+            z_pred, cat_logits = nn_model(xb)
+            loss = nn.functional.mse_loss(z_pred, ycb) + \
+                   0.5 * nn.functional.cross_entropy(cat_logits, ykb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(nn_model.parameters(), 1.0)
+            opt.step()
+        sched.step()
+
+        nn_model.eval()
+        with torch.no_grad():
+            z_v, cl_v = nn_model(Xv)
+            val_loss = (nn.functional.mse_loss(z_v, ycv) +
+                        0.5 * nn.functional.cross_entropy(cl_v, ykv)).item()
+        if val_loss < best_val:
+            best_val = val_loss
+            best_sd  = {k: v.cpu().clone() for k, v in nn_model.state_dict().items()}
+        if epoch % 30 == 0:
+            print(f"    [StageA-NN] epoch {epoch:03d}  val={val_loss:.4f}")
+
+    if best_sd is not None:
+        nn_model.load_state_dict({k: v.to(device) for k, v in best_sd.items()})
+    nn_model.eval()
+    return nn_model
+
+
+def train_stage_A(df_tr, df_va, feature_info: dict,
+                  model_type: str = "catboost", save_dir: str = "") -> dict:
+    """Train Stage A doctor-mimic model.
+
+    model_type : "catboost" | "xgboost" | "rf" | "linear"
+    Returns a dict mapping each CONT_RX column and CAT_RX to a fitted model.
+    All returned models expose .predict(X) with the same interface.
+    """
+    patient_cols = _patient_feature_cols(feature_info)
+    X_tr = df_tr[patient_cols].values
+    X_va = df_va[patient_cols].values
     models: dict = {}
 
-    for col in CONT_RX:
-        m = CatBoostRegressor(
+    # ── CatBoost ──────────────────────────────────────────────────────────────
+    if model_type == "catboost":
+        try:
+            from catboost import CatBoostClassifier, CatBoostRegressor
+        except ImportError:
+            raise ImportError("pip install catboost")
+        for col in CONT_RX:
+            m = CatBoostRegressor(
+                iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
+                depth=CATBOOST_DEPTH, loss_function="RMSE", random_seed=SEED, verbose=0,
+            )
+            m.fit(df_tr[patient_cols], df_tr[col],
+                  eval_set=(df_va[patient_cols], df_va[col]),
+                  early_stopping_rounds=CATBOOST_EARLY_STOP)
+            models[col] = m
+        m_cat = CatBoostClassifier(
             iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
-            depth=CATBOOST_DEPTH, loss_function="RMSE", random_seed=SEED, verbose=0,
+            depth=CATBOOST_DEPTH, loss_function="MultiClass", random_seed=SEED, verbose=0,
         )
-        m.fit(X_tr, df_tr[col],
-              eval_set=(X_va, df_va[col]),
-              early_stopping_rounds=CATBOOST_EARLY_STOP)
-        models[col] = m
-        if save_dir:
-            Path(save_dir).mkdir(parents=True, exist_ok=True)
-            m.save_model(os.path.join(save_dir, f"cb_{col.replace('/', '_')}.cbm"))
+        m_cat.fit(df_tr[patient_cols], df_tr[CAT_RX].astype(int),
+                  eval_set=(df_va[patient_cols], df_va[CAT_RX].astype(int)),
+                  early_stopping_rounds=CATBOOST_EARLY_STOP)
+        models[CAT_RX] = m_cat
 
-    m_cat = CatBoostClassifier(
-        iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
-        depth=CATBOOST_DEPTH, loss_function="MultiClass", random_seed=SEED, verbose=0,
-    )
-    m_cat.fit(X_tr, df_tr[CAT_RX].astype(int),
-              eval_set=(X_va, df_va[CAT_RX].astype(int)),
-              early_stopping_rounds=CATBOOST_EARLY_STOP)
-    models[CAT_RX] = m_cat
+    # ── XGBoost ───────────────────────────────────────────────────────────────
+    elif model_type == "xgboost":
+        try:
+            from xgboost import XGBRegressor, XGBClassifier
+        except ImportError:
+            raise ImportError("pip install xgboost")
+        for col in CONT_RX:
+            m = XGBRegressor(
+                n_estimators=500, learning_rate=0.05, max_depth=6,
+                subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+                early_stopping_rounds=50, eval_metric="rmse", verbosity=0,
+            )
+            m.fit(X_tr, df_tr[col].values,
+                  eval_set=[(X_va, df_va[col].values)], verbose=False)
+            models[col] = m
+        m_cat = XGBClassifier(
+            n_estimators=500, learning_rate=0.05, max_depth=6,
+            subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+            early_stopping_rounds=50, eval_metric="mlogloss", verbosity=0,
+        )
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values,
+                  eval_set=[(X_va, df_va[CAT_RX].astype(int).values)], verbose=False)
+        models[CAT_RX] = m_cat
+
+    # ── Random Forest ─────────────────────────────────────────────────────────
+    elif model_type == "rf":
+        from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+        for col in CONT_RX:
+            m = RandomForestRegressor(
+                n_estimators=300, max_depth=12, min_samples_leaf=5,
+                random_state=SEED, n_jobs=-1,
+            )
+            m.fit(X_tr, df_tr[col].values)
+            models[col] = m
+        m_cat = RandomForestClassifier(
+            n_estimators=300, max_depth=12, min_samples_leaf=5,
+            random_state=SEED, n_jobs=-1,
+        )
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── Linear (Ridge + Logistic) ─────────────────────────────────────────────
+    elif model_type == "linear":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.linear_model import Ridge, LogisticRegression
+        for col in CONT_RX:
+            m = Pipeline([("sc", _SS()), ("m", Ridge(alpha=1.0))])
+            m.fit(X_tr, df_tr[col].values)
+            models[col] = m
+        m_cat = Pipeline([
+            ("sc", _SS()),
+            ("m", LogisticRegression(max_iter=1000, C=1.0,
+                                     multi_class="multinomial", random_state=SEED)),
+        ])
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── Multi-task MLP (DL) ───────────────────────────────────────────────────
+    elif model_type == "mlp_nn":
+        from src.models.stage_a_nn import MultiTaskStageA
+        from src.utils.device import get_device
+        device     = get_device()
+        pat_cols   = _patient_feature_cols(feature_info)
+        n_cat_cls  = int(df_tr[CAT_RX].max()) + 1
+        nn_model   = MultiTaskStageA(len(pat_cols), len(CONT_RX), n_cat_cls)
+        print(f"  [StageA] Training MultiTaskMLP ({len(pat_cols)} features → "
+              f"{len(CONT_RX)} cont + {n_cat_cls} cat) ...")
+        nn_model = _train_stage_A_nn(df_tr, df_va, feature_info, nn_model, device)
+        return {"_type": "nn", "_model": nn_model,
+                "_device": device, "_feature_info": feature_info}
+
+    # ── Transformer (DL) ─────────────────────────────────────────────────────
+    elif model_type == "transformer_nn":
+        from src.models.stage_a_nn import TransformerStageA
+        from src.utils.device import get_device
+        device     = get_device()
+        pat_cols   = _patient_feature_cols(feature_info)
+        n_cat_cls  = int(df_tr[CAT_RX].max()) + 1
+        nn_model   = TransformerStageA(len(pat_cols), len(CONT_RX), n_cat_cls)
+        print(f"  [StageA] Training TransformerStageA ({len(pat_cols)} features → "
+              f"{len(CONT_RX)} cont + {n_cat_cls} cat) ...")
+        nn_model = _train_stage_A_nn(df_tr, df_va, feature_info, nn_model, device)
+        return {"_type": "nn", "_model": nn_model,
+                "_device": device, "_feature_info": feature_info}
+
+    else:
+        raise ValueError(
+            f"Unknown model_type '{model_type}'. "
+            f"Choose: catboost, xgboost, rf, linear, mlp_nn, transformer_nn")
+
     return models
 
 
-def get_stage_A_preds(df, catboost_models: dict, feature_info: dict) -> dict:
+def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict) -> dict:
+    """Get Stage A predictions. Works for ML models and DL (nn) models."""
+
+    # ── DL path ───────────────────────────────────────────────────────────────
+    if stage_a_models.get("_type") == "nn":
+        nn_model    = stage_a_models["_model"]
+        device      = stage_a_models["_device"]
+        feat_info   = stage_a_models["_feature_info"]
+        scaler      = feat_info["scaler"]
+        cont_names  = feat_info["continuous_feature_names"]
+        z_min       = _compute_z_min(feat_info)
+
+        X = _get_patient_Xstd(df, feat_info)
+        Xt = torch.tensor(X, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            z_pred, cat_logits = nn_model(Xt)
+        z_np  = np.maximum(z_pred.cpu().numpy(), z_min)  # non-negativity in z-space
+        cat   = torch.argmax(cat_logits, dim=1).cpu().numpy().astype(np.int64)
+
+        # De-standardize z → raw values
+        cont = np.zeros_like(z_np)
+        for j, col in enumerate(CONT_RX):
+            idx  = cont_names.index(col)
+            mu   = scaler.mean_[idx]
+            sd   = scaler.scale_[idx] if scaler.scale_[idx] > 0 else 1.0
+            raw  = z_np[:, j] * sd + mu
+            step = STEP_MAP[col]
+            cont[:, j] = np.round(raw / step) * step
+        return {"cont": cont.astype(np.float32), "cat": cat}
+
+    # ── ML path ───────────────────────────────────────────────────────────────
     patient_cols = _patient_feature_cols(feature_info)
-    X = df[patient_cols]
+    X = df[patient_cols].values   # numpy array — works for all sklearn/xgb models
     cont = np.zeros((len(df), len(CONT_RX)), dtype=np.float32)
     for j, col in enumerate(CONT_RX):
-        cont[:, j] = catboost_models[col].predict(X).astype(np.float32)
-    cat = catboost_models[CAT_RX].predict(X).astype(np.int64).flatten()
+        raw = stage_a_models[col].predict(X).astype(np.float32)
+        raw = np.maximum(0.0, raw)                   # non-negativity
+        step = STEP_MAP[col]
+        cont[:, j] = np.round(raw / step) * step
+    cat = stage_a_models[CAT_RX].predict(X).astype(np.int64).flatten()
     return {"cont": cont, "cat": cat}
 
 
@@ -230,7 +440,9 @@ def _stage_b_loss(z_pred, logit, xb, yb_cont, yb_cat, yb_doc_hat,
     w_thr     = gate * cfg["LAMBDA_THR_PASS"] + (1 - gate) * cfg["LAMBDA_THR_FAIL"]
     loss_thr  = (w_thr * thr_push).mean()
 
-    d = _doc_dist(z_pred, yb_cont, p_now, yb_cat)
+    # Trust region centered on Stage A prediction (yb_cont_teacher), NOT doctor's Rx.
+    # This is consistent with inference, where doctor's Rx is unavailable.
+    d = _doc_dist(z_pred, yb_cont_teacher, p_now, yb_cat_teacher)
     eps_c = cfg["EPS_CONT_Z_PASS"] + cfg["EPS_CAT_SOFT_PASS"]
     eps_f = cfg["EPS_CONT_Z_FAIL"] + cfg["EPS_CAT_SOFT_FAIL"]
     eps   = gate * eps_c + (1 - gate) * eps_f
@@ -322,15 +534,32 @@ def infer_prescriptions(
     model: nn.Module, df_part, feature_info: dict,
     f1_model: nn.Module, device: torch.device,
     cfg: dict,
+    stage_a_preds: Optional[dict] = None,
 ) -> "pd.DataFrame":
+    """Generate prescription recommendations.
+
+    stage_a_preds : dict with keys 'cont' (np.ndarray, raw values) and 'cat'
+        (np.ndarray, int).  When provided, Stage A predictions are used as the
+        trust-region anchor and PASS/FAIL gate — no doctor Rx needed at inference.
+        When None, falls back to doctor's Rx (only for ablation baselines like C5).
+    """
     import pandas as pd
     orig_features = feature_info["original_feature_names"]
     cont_names    = feature_info["continuous_feature_names"]
     scaler        = feature_info["scaler"]
 
     model.eval()
-    doc_hat   = _f1_predict_raw(df_part, feature_info, f1_model, device)
-    gate_pass = doc_hat >= cfg["THR_GATE"]
+
+    # Gate: F1 evaluated on Stage A's predicted Rx (or doctor's Rx as fallback)
+    if stage_a_preds is not None:
+        df_anchor = df_part[orig_features].copy()
+        for j, col in enumerate(CONT_RX):
+            df_anchor[col] = stage_a_preds["cont"][:, j]
+        df_anchor[CAT_RX] = stage_a_preds["cat"]
+        anchor_hat = _f1_predict_raw(df_anchor, feature_info, f1_model, device)
+    else:
+        anchor_hat = _f1_predict_raw(df_part, feature_info, f1_model, device)
+    gate_pass = anchor_hat >= cfg["THR_GATE"]
 
     Xstd = standardize_like_f1(df_part, feature_info)
     for c in [CAT_RX] + CONT_RX:
@@ -348,12 +577,20 @@ def infer_prescriptions(
         p_now   = torch.softmax(logit, dim=1)
         cat_idx = torch.argmax(p_now, dim=1).cpu().numpy().astype(int)
 
+        # Trust region anchor: Stage A predicted Rx (or doctor's Rx as fallback)
         z_doc = np.zeros((len(chunk), len(CONT_RX)), dtype=np.float32)
-        for j, col in enumerate(CONT_RX):
-            idx = cont_names.index(col)
-            mu  = scaler.mean_[idx]
-            sd  = scaler.scale_[idx] if scaler.scale_[idx] > 0 else 1.0
-            z_doc[:, j] = (chunk[col].values.astype(np.float32) - mu) / sd
+        if stage_a_preds is not None:
+            for j, col in enumerate(CONT_RX):
+                idx = cont_names.index(col)
+                mu  = scaler.mean_[idx]
+                sd  = scaler.scale_[idx] if scaler.scale_[idx] > 0 else 1.0
+                z_doc[:, j] = (stage_a_preds["cont"][i:i+bs, j] - mu) / sd
+        else:
+            for j, col in enumerate(CONT_RX):
+                idx = cont_names.index(col)
+                mu  = scaler.mean_[idx]
+                sd  = scaler.scale_[idx] if scaler.scale_[idx] > 0 else 1.0
+                z_doc[:, j] = (chunk[col].values.astype(np.float32) - mu) / sd
 
         z_np   = z_pred.cpu().numpy()
         z_proj = z_np.copy()
@@ -409,6 +646,8 @@ def run_f2_pipeline(
     overrides: Optional[dict] = None,
     ckpt_dir:  str = "results/f2/checkpoints",
     label:     str = "f2",
+    stage_a_type: str = "catboost",
+    stage_b_type: str = "mlp",
 ) -> dict:
     """
     Run full F2 pipeline and return metrics dict.
@@ -426,13 +665,16 @@ def run_f2_pipeline(
         teacher_tr = _doctor_teacher_preds(df_train, feature_info)
         teacher_va = _doctor_teacher_preds(df_val,   feature_info)
         teacher_te = _doctor_teacher_preds(df_test,  feature_info)
+        stage_a_te = None   # no Stage A → inference falls back to doctor Rx
         print(f"[{label}] Stage A skipped — using doctor Rx as teacher anchor.")
     else:
-        print(f"[{label}] Running Stage A (CatBoost)...")
-        cb_models  = train_stage_A(df_train, df_val, feature_info)
-        teacher_tr = get_stage_A_preds(df_train, cb_models, feature_info)
-        teacher_va = get_stage_A_preds(df_val,   cb_models, feature_info)
-        teacher_te = get_stage_A_preds(df_test,  cb_models, feature_info)
+        print(f"[{label}] Running Stage A ({stage_a_type})...")
+        sa_models  = train_stage_A(df_train, df_val, feature_info,
+                                   model_type=stage_a_type)
+        teacher_tr = get_stage_A_preds(df_train, sa_models, feature_info)
+        teacher_va = get_stage_A_preds(df_val,   sa_models, feature_info)
+        teacher_te = get_stage_A_preds(df_test,  sa_models, feature_info)
+        stage_a_te = teacher_te   # used at inference as anchor
 
     # ── Datasets ─────────────────────────────────────────────────────────────
     def f1_fn(df_part):
@@ -451,19 +693,19 @@ def run_f2_pipeline(
     K      = int(df_train[CAT_RX].max()) + 1
     in_dim = len(orig_features)
 
-    if cfg["use_linear_head"]:
-        # A-F2-7: replace MLP with linear
-        class LinearRxHead(nn.Module):
+    if cfg.get("use_linear_head", False):
+        # Legacy ablation A-F2-7 support
+        class _LinearRxHead(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.head_cont = nn.Linear(in_dim, len(CONT_RX))
                 self.head_cat  = nn.Linear(in_dim, K)
             def forward(self, x):
                 return self.head_cont(x), self.head_cat(x)
-        model_b = LinearRxHead()
+        model_b = _LinearRxHead()
     else:
-        model_b = F2RxHead(in_dim=in_dim, n_cont=len(CONT_RX), n_cat=K,
-                           hidden=cfg["F2_HIDDEN"], dropout=cfg["F2_DROPOUT"])
+        model_b = build_stage_b(stage_b_type, in_dim, len(CONT_RX), K, cfg)
+    print(f"[{label}] Stage B architecture: {stage_b_type}")
 
     ckpt_path = os.path.join(ckpt_dir, f"{label}_best.pth")
     print(f"[{label}] Running Stage B (MLP optimization)...")
@@ -476,7 +718,8 @@ def run_f2_pipeline(
 
     # ── Inference on test set ─────────────────────────────────────────────────
     rx_test = infer_prescriptions(model_b, df_test, feature_info,
-                                  f1_model, device, cfg)
+                                  f1_model, device, cfg,
+                                  stage_a_preds=stage_a_te)
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     ktv_actual = df_test[OUTCOME_COL].values.astype(float)

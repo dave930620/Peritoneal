@@ -275,8 +275,18 @@ class RxDataset(Dataset):
         # --- Ground-truth outcome (for reporting only) ---
         self.y_outcome = df[OUTCOME_COL].astype(float).values.astype(np.float32)
 
-        # --- PASS/FAIL gate: F1 prediction under doctor's prescription ---
-        self.y_doc_hat = f1_predict_fn(df[orig_features]).astype(np.float32)
+        # --- PASS/FAIL gate: F1 prediction under Stage A prescription ---
+        # If teacher_preds are available (Stage A ran), evaluate F1 on Stage A's Rx
+        # so that the gate is consistent with inference (where doctor's Rx is unknown).
+        if teacher_preds is not None:
+            df_for_gate = df[orig_features].copy()
+            for j, col in enumerate(CONT_RX):
+                df_for_gate[col] = teacher_preds["cont"][:, j]
+            df_for_gate[CAT_RX] = teacher_preds["cat"]
+            self.y_doc_hat = f1_predict_fn(df_for_gate).astype(np.float32)
+        else:
+            # Fallback (no Stage A): use doctor's Rx — only for C5/no-anchor baseline
+            self.y_doc_hat = f1_predict_fn(df[orig_features]).astype(np.float32)
 
         # --- CatBoost teacher anchor ---
         if teacher_preds is not None:
