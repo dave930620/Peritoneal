@@ -774,11 +774,30 @@ def run_f2_pipeline(
     metrics = f2_metrics(ktv_doctor, ktv_model, ktv_actual,
                          rx_doctor_dict, rx_model_dict)
 
-    # Categorical accuracy
+    # Categorical accuracy (full pipeline)
     gt_cat = df_test[CAT_RX].astype(int).values
     pr_cat = rx_test[CAT_RX].astype(int).values
     metrics["cat_accuracy"] = float(np.mean(gt_cat == pr_cat))
 
-    print(f"[{label}] p_pass={metrics.get('p_pass', float('nan')):.4f}  "
-          f"delta_ktv_fail={metrics.get('delta_ktv_fail', float('nan')):.4f}")
+    # ── Stage A only evaluation (same metrics without Stage B) ───────────────
+    # Measures how much Stage B adds on top of Stage A alone.
+    if stage_a_te is not None:
+        patched_a = df_test[orig_features].copy()
+        for j, col in enumerate(CONT_RX):
+            patched_a[col] = stage_a_te["cont"][:, j]
+        patched_a[CAT_RX] = stage_a_te["cat"]
+        ktv_stage_a = _f1_predict_raw(patched_a, feature_info, f1_model, device)
+
+        rx_stage_a_dict = {col: stage_a_te["cont"][:, j] for j, col in enumerate(CONT_RX)}
+        metrics_a = f2_metrics(ktv_doctor, ktv_stage_a, ktv_actual,
+                               rx_doctor_dict, rx_stage_a_dict)
+        metrics_a["cat_accuracy"] = float(np.mean(gt_cat == stage_a_te["cat"].flatten()))
+        # Store Stage A metrics with "stage_a_" prefix
+        skip = {"threshold", "n_doc_fail", "n_doc_pass"}
+        for k, v in metrics_a.items():
+            if k not in skip:
+                metrics[f"stage_a_{k}"] = v
+
+    print(f"[{label}] p_rescue={metrics.get('p_rescue', float('nan')):.4f}  "
+          f"delta_ktv_doc_fail={metrics.get('delta_ktv_doc_fail', float('nan')):.4f}")
     return metrics

@@ -290,6 +290,7 @@ def _write_report(best_sa_type: str):
     # ── Visualizations ────────────────────────────────────────────────────────
     _plot_model_comparison(df)
     _plot_winner_detail(winner_raw, winner["label"])
+    _plot_all_combos(data)
 
 
 def _plot_model_comparison(df: pd.DataFrame):
@@ -338,6 +339,68 @@ def _plot_model_comparison(df: pd.DataFrame):
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Comparison plot saved → {path}")
+
+
+def _plot_all_combos(data: dict):
+    """One figure per Stage A+B combination: Stage A only vs full pipeline."""
+    plot_dir = os.path.join(os.path.dirname(REPORT_PATH), "combo_plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Metrics to compare, with display labels and whether higher is better
+    METRIC_SPECS = [
+        ("delta_ktv_doc_fail",    "ΔKt/V\n(fail pts)",     True),
+        ("delta_ktv_doc_pass",    "ΔKt/V\n(pass pts)",     None),   # want ≈0
+        ("delta_ktv_all",         "ΔKt/V\n(all pts)",      True),
+        ("p_rescue",              "p_rescue\n(fail→pass)",  True),
+        ("p_harm",                "p_harm\n(pass→fail)",    False),
+        ("avg_pearson",           "Pearson\n(overall)",     True),
+        ("avg_pearson_doc_fail",  "Pearson\n(fail pts)",    None),
+        ("avg_pearson_doc_pass",  "Pearson\n(pass pts)",    True),
+        ("cat_accuracy",          "Cat\naccuracy",          True),
+    ]
+
+    for label, m in data.items():
+        if "error" in m:
+            continue
+        sa_type = m.get("_stage_a", "?")
+        sb_type = m.get("_stage_b", "?")
+
+        stage_a_vals = [m.get(f"stage_a_{key}", float("nan")) for key, _, _ in METRIC_SPECS]
+        full_vals    = [m.get(key,               float("nan")) for key, _, _ in METRIC_SPECS]
+
+        x      = np.arange(len(METRIC_SPECS))
+        width  = 0.35
+        fig, ax = plt.subplots(figsize=(14, 5))
+
+        bars_a = ax.bar(x - width/2, stage_a_vals, width,
+                        label=f"Stage A only ({sa_type})", color="#5b8db8", alpha=0.85)
+        bars_b = ax.bar(x + width/2, full_vals,    width,
+                        label=f"Stage A+B ({sa_type} + {sb_type})", color="#e07b39", alpha=0.85)
+
+        # Value labels on bars
+        for bar in list(bars_a) + list(bars_b):
+            h = bar.get_height()
+            if not np.isnan(h):
+                ax.text(bar.get_x() + bar.get_width() / 2, h + 0.005,
+                        f"{h:.3f}", ha="center", va="bottom", fontsize=7)
+
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.set_xticks(x)
+        ax.set_xticklabels([spec[1] for spec in METRIC_SPECS], fontsize=9)
+        ax.set_ylabel("Metric value")
+        ax.set_title(f"Stage A only vs Stage A+B  —  {label}\n"
+                     f"Stage A: {sa_type}   Stage B: {sb_type}",
+                     fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+
+        safe_label = label.replace("/", "_")
+        path = os.path.join(plot_dir, f"{safe_label}.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+
+    print(f"Per-combo plots saved → {plot_dir}/")
 
 
 def _plot_winner_detail(m: dict, label: str):
