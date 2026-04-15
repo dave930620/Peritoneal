@@ -27,6 +27,9 @@ import io, contextlib, json
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from src.config import (
     CAT_RX, CONT_RX, DATA_CSV, F1_MODEL_PATH, FEATURE_INFO_PATH,
@@ -46,7 +49,7 @@ CKPT_DIR     = "results/f2_lag/checkpoints"
 MIN_PEARSON  = 0.70   # clinical realism floor
 
 # Phase 1: all Stage A options, fixed Residual Stage B
-STAGE_A_TYPES = ["catboost", "xgboost", "rf", "linear"]
+STAGE_A_TYPES = ["catboost", "rf", "linear"]
 
 # Phase 2: all Stage B options, fixed best Stage A
 STAGE_B_TYPES = ["mlp", "deep_mlp", "residual", "transformer"]
@@ -76,8 +79,12 @@ def load_f1(feature_info, device):
 
 
 def avg_pearson(metrics: dict) -> float:
-    keys = [k for k in metrics if k.startswith("pearson_")]
-    return float(np.mean([metrics[k] for k in keys])) if keys else 0.0
+    """Overall average Pearson (stored directly in metrics dict)."""
+    if "avg_pearson" in metrics:
+        return float(metrics["avg_pearson"])
+    # Fallback: compute from per-column keys (no _doc_ suffix)
+    keys = [k for k in metrics if k.startswith("pearson_") and "_doc_" not in k]
+    return float(np.nanmean([metrics[k] for k in keys])) if keys else 0.0
 
 
 def best_from_results(key_prefix: str) -> str:
@@ -212,56 +219,153 @@ def main():
     _write_report(best_sa_type)
 
 
+def _build_rows(data: dict) -> pd.DataFrame:
+    rows = []
+    for label, m in data.items():
+        err = "error" in m
+        rows.append({
+            "label":               label,
+            "stage_a":             m.get("_stage_a", "?"),
+            "stage_b":             m.get("_stage_b", "?"),
+            "delta_ktv_doc_fail":  float("nan") if err else m.get("delta_ktv_doc_fail", float("nan")),
+            "delta_ktv_doc_pass":  float("nan") if err else m.get("delta_ktv_doc_pass", float("nan")),
+            "delta_ktv_all":       float("nan") if err else m.get("delta_ktv_all",       float("nan")),
+            "p_rescue":            float("nan") if err else m.get("p_rescue",            float("nan")),
+            "p_harm":              float("nan") if err else m.get("p_harm",              float("nan")),
+            "avg_pearson":         float("nan") if err else avg_pearson(m),
+            "avg_pearson_doc_fail":float("nan") if err else m.get("avg_pearson_doc_fail",float("nan")),
+            "avg_pearson_doc_pass":float("nan") if err else m.get("avg_pearson_doc_pass",float("nan")),
+            "cat_accuracy":        float("nan") if err else m.get("cat_accuracy",        float("nan")),
+            "realistic":           False if err else avg_pearson(m) >= MIN_PEARSON,
+            "error":               err,
+        })
+    return pd.DataFrame(rows).sort_values("delta_ktv_doc_fail", ascending=False)
+
+
 def _write_report(best_sa_type: str):
     if not os.path.exists(RESULTS_PATH):
         return
     with open(RESULTS_PATH) as f:
         data = json.load(f)
 
-    rows = []
-    for label, m in data.items():
-        if "error" in m:
-            rows.append({"label": label, "stage_a": m.get("_stage_a", "?"),
-                         "stage_b": m.get("_stage_b", "?"),
-                         "delta_ktv_fail": float("nan"), "p_pass": float("nan"),
-                         "avg_pearson": float("nan"), "realistic": False})
-            continue
-        ap = avg_pearson(m)
-        rows.append({
-            "label":          label,
-            "stage_a":        m.get("_stage_a", "?"),
-            "stage_b":        m.get("_stage_b", "?"),
-            "delta_ktv_fail": m.get("delta_ktv_fail", float("nan")),
-            "p_pass":         m.get("p_pass", float("nan")),
-            "avg_pearson":    ap,
-            "realistic":      ap >= MIN_PEARSON,
-        })
+    df = _build_rows(data)
+    os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
 
-    df = pd.DataFrame(rows).sort_values("delta_ktv_fail", ascending=False)
+    # ── Console + text report ─────────────────────────────────────────────────
+    show_cols = ["label","stage_a","stage_b",
+                 "delta_ktv_doc_fail","delta_ktv_doc_pass","delta_ktv_all",
+                 "p_rescue","p_harm",
+                 "avg_pearson","avg_pearson_doc_fail","avg_pearson_doc_pass",
+                 "cat_accuracy","realistic"]
     print("\n" + "="*60)
-    print("FULL RESULTS (sorted by delta_ktv_fail):")
-    print(df[["label","stage_a","stage_b","delta_ktv_fail",
-              "p_pass","avg_pearson","realistic"]].to_string(index=False))
+    print("FULL RESULTS (sorted by delta_ktv_doc_fail):")
+    print(df[show_cols].to_string(index=False))
 
-    # Best overall
-    real = df[df["realistic"]]
-    winner = real.iloc[0] if not real.empty else df.iloc[0]
+    real   = df[df["realistic"] & ~df["error"]]
+    valid  = df[~df["error"]]
+    winner = real.iloc[0] if not real.empty else (valid.iloc[0] if not valid.empty else df.iloc[0])
+    winner_raw = data.get(winner["label"], {})
+
     winner_msg = (
         f"\n★ RECOMMENDED MODEL\n"
-        f"  Stage A : {winner['stage_a']}\n"
-        f"  Stage B : {winner['stage_b']}\n"
-        f"  delta_ktv_fail : {winner['delta_ktv_fail']:.4f}\n"
-        f"  p_pass         : {winner['p_pass']:.4f}\n"
-        f"  avg_pearson    : {winner['avg_pearson']:.4f}\n"
-        f"  realistic      : {winner['realistic']}\n"
+        f"  Stage A               : {winner['stage_a']}\n"
+        f"  Stage B               : {winner['stage_b']}\n"
+        f"  delta_ktv_doc_fail    : {winner['delta_ktv_doc_fail']:.4f}  (improvement on doctor-fail patients)\n"
+        f"  delta_ktv_doc_pass    : {winner['delta_ktv_doc_pass']:.4f}  (change on doctor-pass patients)\n"
+        f"  p_rescue              : {winner['p_rescue']:.4f}  (fraction of fail patients rescued)\n"
+        f"  p_harm                : {winner['p_harm']:.4f}  (fraction of pass patients harmed)\n"
+        f"  avg_pearson           : {winner['avg_pearson']:.4f}  (overall Rx similarity to doctor)\n"
+        f"  avg_pearson_doc_fail  : {winner['avg_pearson_doc_fail']:.4f}  (Rx similarity, fail group — lower expected)\n"
+        f"  avg_pearson_doc_pass  : {winner['avg_pearson_doc_pass']:.4f}  (Rx similarity, pass group — higher expected)\n"
+        f"  cat_accuracy          : {winner['cat_accuracy']:.4f}\n"
+        f"  realistic (pearson>=0.70) : {winner['realistic']}\n"
     )
     print(winner_msg)
 
-    report = df.to_string(index=False) + "\n\n" + winner_msg
-    os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
+    report_text = df[show_cols].to_string(index=False) + "\n\n" + winner_msg
     with open(REPORT_PATH, "w") as f:
-        f.write(report)
-    print(f"\nReport saved → {REPORT_PATH}")
+        f.write(report_text)
+    print(f"Report saved → {REPORT_PATH}")
+
+    # ── Visualizations ────────────────────────────────────────────────────────
+    _plot_model_comparison(df)
+    _plot_winner_detail(winner_raw, winner["label"])
+
+
+def _plot_model_comparison(df: pd.DataFrame):
+    """3-panel bar chart comparing all model combinations."""
+    valid = df[~df["error"]].reset_index(drop=True)
+    if valid.empty:
+        return
+
+    labels = [f"{r.stage_a}\n{r.stage_b}" for _, r in valid.iterrows()]
+    x = np.arange(len(labels))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    # Panel 1: Kt/V improvement
+    ax = axes[0]
+    ax.bar(x - 0.2, valid["delta_ktv_doc_fail"], 0.4, label="Doc-fail group", color="#e07b39")
+    ax.bar(x + 0.2, valid["delta_ktv_doc_pass"], 0.4, label="Doc-pass group", color="#5b8db8")
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("avg(model Kt/V − doctor Kt/V)")
+    ax.set_title("Kt/V Improvement by Group")
+    ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
+
+    # Panel 2: Rescue & Harm rates
+    ax = axes[1]
+    ax.bar(x - 0.2, valid["p_rescue"], 0.4, label="p_rescue (fail→pass) ↑", color="#2ca02c")
+    ax.bar(x + 0.2, valid["p_harm"],   0.4, label="p_harm (pass→fail) ↓",   color="#d62728")
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Rate")
+    ax.set_title("Rescue Rate vs Harm Rate")
+    ax.set_ylim(0, 1); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
+
+    # Panel 3: Pearson by group
+    ax = axes[2]
+    ax.bar(x - 0.27, valid["avg_pearson"],          0.27, label="Overall",   color="#9467bd")
+    ax.bar(x,        valid["avg_pearson_doc_fail"],  0.27, label="Doc-fail",  color="#e07b39")
+    ax.bar(x + 0.27, valid["avg_pearson_doc_pass"],  0.27, label="Doc-pass",  color="#5b8db8")
+    ax.axhline(MIN_PEARSON, color="red", linestyle="--", linewidth=1, label=f"≥{MIN_PEARSON}")
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Pearson r  (model Rx vs doctor Rx)")
+    ax.set_title("Rx Similarity by Patient Group")
+    ax.set_ylim(-0.1, 1.05); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
+
+    plt.suptitle("F2 Model Search: All Combinations", fontsize=13, y=1.02)
+    plt.tight_layout()
+    path = os.path.join(os.path.dirname(REPORT_PATH), "model_comparison.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Comparison plot saved → {path}")
+
+
+def _plot_winner_detail(m: dict, label: str):
+    """Per-column Pearson split for the winning model."""
+    from src.config import CONT_RX
+    cols      = CONT_RX
+    safe_cols = [c.replace(" ", "_").replace("/", "_") for c in cols]
+
+    overall   = [m.get(f"pearson_{s}",          float("nan")) for s in safe_cols]
+    doc_fail  = [m.get(f"pearson_{s}_doc_fail",  float("nan")) for s in safe_cols]
+    doc_pass  = [m.get(f"pearson_{s}_doc_pass",  float("nan")) for s in safe_cols]
+
+    x     = np.arange(len(cols))
+    width = 0.27
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.bar(x - width, overall,  width, label="Overall",  color="#9467bd")
+    ax.bar(x,         doc_fail, width, label="Doc-fail (model explores more → lower OK)", color="#e07b39")
+    ax.bar(x + width, doc_pass, width, label="Doc-pass (model stays close → higher OK)",  color="#5b8db8")
+    ax.axhline(MIN_PEARSON, color="red", linestyle="--", linewidth=1, label=f"≥{MIN_PEARSON} target")
+    ax.set_xticks(x); ax.set_xticklabels(cols, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("Pearson r")
+    ax.set_title(f"Winner ({label}): Per-Column Rx Pearson — Overall / Doc-Fail / Doc-Pass")
+    ax.set_ylim(-0.1, 1.05); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(os.path.dirname(REPORT_PATH), "winner_pearson_split.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Winner detail plot saved → {path}")
 
 
 if __name__ == "__main__":
