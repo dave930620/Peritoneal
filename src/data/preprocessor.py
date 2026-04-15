@@ -214,6 +214,50 @@ def patient_split(
 # F2 Dataset
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Lag feature construction (for F2 with temporal context)
+# ---------------------------------------------------------------------------
+
+def build_lag_features(
+    df: pd.DataFrame,
+    patient_id_col: str = PATIENT_ID_COL,
+    time_col: str = "記錄時間",
+) -> pd.DataFrame:
+    """Add one-step lag features sorted by time per patient.
+
+    For each record, the previous visit's prescription values and Kt/V are
+    appended as new columns (prev_{col}).  First-visit rows have NaN lags
+    and are flagged with is_first_visit=1.
+
+    Call drop_first_visits() after this to remove untrainable first-visit rows.
+
+    Added columns
+    -------------
+    prev_{OUTCOME_COL}       : previous Kt/V
+    prev_{col} for col in CONT_RX + [CAT_RX]
+    is_first_visit           : 1 if no prior record exists for this patient
+    """
+    df = df.sort_values([patient_id_col, time_col]).copy()
+    lag_sources = [OUTCOME_COL] + CONT_RX + [CAT_RX]
+    for col in lag_sources:
+        df[f"prev_{col}"] = df.groupby(patient_id_col)[col].shift(1)
+    df["is_first_visit"] = df[f"prev_{OUTCOME_COL}"].isna().astype(int)
+    return df
+
+
+def drop_first_visits(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows with no prior visit (lag features would be NaN).
+
+    Must be called after build_lag_features().
+    """
+    return df[df["is_first_visit"] == 0].drop(columns=["is_first_visit"]).reset_index(drop=True)
+
+
+def lag_feature_names() -> list:
+    """Return the ordered list of lag feature column names."""
+    return [f"prev_{col}" for col in [OUTCOME_COL] + CONT_RX + [CAT_RX]]
+
+
 class RxDataset(Dataset):
     """Dataset for F2 prescription learning.
 
