@@ -284,6 +284,10 @@ class RxDataset(Dataset):
         Optional dict with keys 'cont' (np.ndarray, shape [N, len(CONT_RX)], raw values)
         and 'cat' (np.ndarray, shape [N,], int).
         When None, the doctor's own prescription is used as the teacher anchor.
+    lag_arr : np.ndarray | None
+        Optional pre-normalized lag features, shape (N, n_lag).
+        When provided, appended to X so Stage A/B can use temporal context.
+        F1 oracle always uses only the first len(orig_features) columns of X.
     """
 
     def __init__(
@@ -292,6 +296,7 @@ class RxDataset(Dataset):
         feature_info: dict,
         f1_predict_fn,
         teacher_preds: Optional[dict] = None,
+        lag_arr: Optional[np.ndarray] = None,
     ):
         self.df = df.reset_index(drop=True)
         orig_features = feature_info["original_feature_names"]
@@ -304,6 +309,9 @@ class RxDataset(Dataset):
             if c in Xstd.columns:
                 Xstd[c] = 0.0 if c != CAT_RX else 0
         self.X = Xstd.values.astype(np.float32)
+        # Append lag features if provided (F1 oracle always uses only [:n_orig])
+        if lag_arr is not None:
+            self.X = np.hstack([self.X, lag_arr.astype(np.float32)])
 
         # --- Doctor's continuous prescription in z-space ---
         self.y_cont = np.zeros((len(df), len(CONT_RX)), dtype=np.float32)

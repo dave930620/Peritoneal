@@ -208,16 +208,19 @@ def _train_stage_A_nn(df_tr, df_va, feature_info: dict,
 
 
 def train_stage_A(df_tr, df_va, feature_info: dict,
-                  model_type: str = "catboost", save_dir: str = "") -> dict:
+                  model_type: str = "catboost", save_dir: str = "",
+                  lag_cols: Optional[list] = None) -> dict:
     """Train Stage A doctor-mimic model.
 
     model_type : "catboost" | "xgboost" | "rf" | "linear"
+    lag_cols   : extra column names from build_lag_features() to include in input.
     Returns a dict mapping each CONT_RX column and CAT_RX to a fitted model.
     All returned models expose .predict(X) with the same interface.
     """
     patient_cols = _patient_feature_cols(feature_info)
-    X_tr = df_tr[patient_cols].values
-    X_va = df_va[patient_cols].values
+    input_cols   = patient_cols + (lag_cols or [])
+    X_tr = df_tr[input_cols].values
+    X_va = df_va[input_cols].values
     models: dict = {}
 
     # ── CatBoost ──────────────────────────────────────────────────────────────
@@ -338,7 +341,8 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
     return models
 
 
-def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict) -> dict:
+def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict,
+                      lag_cols: Optional[list] = None) -> dict:
     """Get Stage A predictions. Works for ML models and DL (nn) models."""
 
     # ── DL path ───────────────────────────────────────────────────────────────
@@ -370,7 +374,8 @@ def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict) -> dict:
 
     # ── ML path ───────────────────────────────────────────────────────────────
     patient_cols = _patient_feature_cols(feature_info)
-    X = df[patient_cols].values   # numpy array — works for all sklearn/xgb models
+    input_cols   = patient_cols + (lag_cols or [])
+    X = df[input_cols].values   # numpy array — works for all sklearn/xgb models
     cont = np.zeros((len(df), len(CONT_RX)), dtype=np.float32)
     for j, col in enumerate(CONT_RX):
         raw = stage_a_models[col].predict(X).astype(np.float32)
@@ -423,7 +428,9 @@ def _stage_b_loss(z_pred, logit, xb, yb_cont, yb_cat, yb_doc_hat,
     z_pred   = torch.clamp(z_pred, min=z_min_t)
 
     # F1 prediction with F2's Rx patched in
-    Xstd  = xb.clone().float()
+    # Strip lag features (xb may have extra columns appended) — F1 only accepts n_orig
+    n_orig = len(orig_features)
+    Xstd  = xb[:, :n_orig].clone().float()
     for j, col in enumerate(CONT_RX):
         Xstd[:, orig_features.index(col)] = z_pred[:, j]
     cat_idx = torch.argmax(p_now, dim=1).float()
@@ -535,6 +542,7 @@ def infer_prescriptions(
     f1_model: nn.Module, device: torch.device,
     cfg: dict,
     stage_a_preds: Optional[dict] = None,
+    lag_arr: Optional[np.ndarray] = None,
 ) -> "pd.DataFrame":
     """Generate prescription recommendations.
 
@@ -542,6 +550,9 @@ def infer_prescriptions(
         (np.ndarray, int).  When provided, Stage A predictions are used as the
         trust-region anchor and PASS/FAIL gate — no doctor Rx needed at inference.
         When None, falls back to doctor's Rx (only for ablation baselines like C5).
+    lag_arr : np.ndarray | None
+        Pre-normalized lag features (N, n_lag). When provided, appended to the
+        Stage B input matrix so the model can use temporal context.
     """
     import pandas as pd
     orig_features = feature_info["original_feature_names"]
@@ -566,6 +577,9 @@ def infer_prescriptions(
         if c in Xstd.columns:
             Xstd[c] = 0.0
     Xmat = Xstd.values.astype(np.float32)
+    # Append lag features if provided (F1 gate already computed above without them)
+    if lag_arr is not None:
+        Xmat = np.hstack([Xmat, lag_arr.astype(np.float32)])
 
     rows, N = [], Xmat.shape[0]
     bs = cfg["F2_BATCH_SIZE"]
@@ -638,6 +652,15 @@ def _f1_predict_raw(df_part, feature_info: dict, f1_model, device) -> np.ndarray
 # Full pipeline (used by run_baselines.py / run_ablations.py)
 # ---------------------------------------------------------------------------
 
+def _normalize_lag(lag_tr: np.ndarray, lag_va: np.ndarray,
+                   lag_te: np.ndarray):
+    """Z-score lag features using training-set statistics."""
+    mu = lag_tr.mean(axis=0)
+    sd = lag_tr.std(axis=0)
+    sd[sd < 1e-6] = 1.0
+    return (lag_tr - mu) / sd, (lag_va - mu) / sd, (lag_te - mu) / sd
+
+
 def run_f2_pipeline(
     df_train, df_val, df_test,
     feature_info: dict,
@@ -648,9 +671,14 @@ def run_f2_pipeline(
     label:     str = "f2",
     stage_a_type: str = "catboost",
     stage_b_type: str = "mlp",
+    lag_cols: Optional[list] = None,
 ) -> dict:
     """
     Run full F2 pipeline and return metrics dict.
+
+    lag_cols : list of column names produced by build_lag_features().
+               When provided, lag features are appended to Stage A/B inputs.
+               F1 oracle always uses only the original feature columns.
 
     Returns
     -------
@@ -659,6 +687,15 @@ def run_f2_pipeline(
     import pandas as pd
     use_amp = device.type == "cuda"
     cfg     = make_cfg(overrides)
+
+    # ── Lag feature arrays (normalized) ──────────────────────────────────────
+    if lag_cols:
+        lag_tr_raw = df_train[lag_cols].values.astype(np.float32)
+        lag_va_raw = df_val[lag_cols].values.astype(np.float32)
+        lag_te_raw = df_test[lag_cols].values.astype(np.float32)
+        lag_tr, lag_va, lag_te = _normalize_lag(lag_tr_raw, lag_va_raw, lag_te_raw)
+    else:
+        lag_tr = lag_va = lag_te = None
 
     # ── Stage A ──────────────────────────────────────────────────────────────
     if cfg["skip_stage_A"]:
@@ -670,10 +707,10 @@ def run_f2_pipeline(
     else:
         print(f"[{label}] Running Stage A ({stage_a_type})...")
         sa_models  = train_stage_A(df_train, df_val, feature_info,
-                                   model_type=stage_a_type)
-        teacher_tr = get_stage_A_preds(df_train, sa_models, feature_info)
-        teacher_va = get_stage_A_preds(df_val,   sa_models, feature_info)
-        teacher_te = get_stage_A_preds(df_test,  sa_models, feature_info)
+                                   model_type=stage_a_type, lag_cols=lag_cols)
+        teacher_tr = get_stage_A_preds(df_train, sa_models, feature_info, lag_cols=lag_cols)
+        teacher_va = get_stage_A_preds(df_val,   sa_models, feature_info, lag_cols=lag_cols)
+        teacher_te = get_stage_A_preds(df_test,  sa_models, feature_info, lag_cols=lag_cols)
         stage_a_te = teacher_te   # used at inference as anchor
 
     # ── Datasets ─────────────────────────────────────────────────────────────
@@ -681,9 +718,9 @@ def run_f2_pipeline(
         return _f1_predict_raw(df_part, feature_info, f1_model, device)
 
     orig_features = feature_info["original_feature_names"]
-    ds_tr = RxDataset(df_train, feature_info, f1_fn, teacher_preds=teacher_tr)
-    ds_va = RxDataset(df_val,   feature_info, f1_fn, teacher_preds=teacher_va)
-    ds_te = RxDataset(df_test,  feature_info, f1_fn, teacher_preds=teacher_te)
+    ds_tr = RxDataset(df_train, feature_info, f1_fn, teacher_preds=teacher_tr, lag_arr=lag_tr)
+    ds_va = RxDataset(df_val,   feature_info, f1_fn, teacher_preds=teacher_va, lag_arr=lag_va)
+    ds_te = RxDataset(df_test,  feature_info, f1_fn, teacher_preds=teacher_te, lag_arr=lag_te)
 
     dl_kwargs = {"num_workers": 0, "pin_memory": False}
     dl_tr = DataLoader(ds_tr, batch_size=cfg["F2_BATCH_SIZE"], shuffle=True,  **dl_kwargs)
@@ -691,7 +728,8 @@ def run_f2_pipeline(
 
     # ── Stage B model ────────────────────────────────────────────────────────
     K      = int(df_train[CAT_RX].max()) + 1
-    in_dim = len(orig_features)
+    n_lag  = lag_tr.shape[1] if lag_tr is not None else 0
+    in_dim = len(orig_features) + n_lag
 
     if cfg.get("use_linear_head", False):
         # Legacy ablation A-F2-7 support
@@ -705,10 +743,10 @@ def run_f2_pipeline(
         model_b = _LinearRxHead()
     else:
         model_b = build_stage_b(stage_b_type, in_dim, len(CONT_RX), K, cfg)
-    print(f"[{label}] Stage B architecture: {stage_b_type}")
+    print(f"[{label}] Stage B architecture: {stage_b_type}  in_dim={in_dim}")
 
     ckpt_path = os.path.join(ckpt_dir, f"{label}_best.pth")
-    print(f"[{label}] Running Stage B (MLP optimization)...")
+    print(f"[{label}] Running Stage B ...")
     train_stage_B(model_b, dl_tr, dl_va, f1_model, feature_info,
                   device, cfg, use_amp, ckpt_path)
 
@@ -719,7 +757,8 @@ def run_f2_pipeline(
     # ── Inference on test set ─────────────────────────────────────────────────
     rx_test = infer_prescriptions(model_b, df_test, feature_info,
                                   f1_model, device, cfg,
-                                  stage_a_preds=stage_a_te)
+                                  stage_a_preds=stage_a_te,
+                                  lag_arr=lag_te)
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     ktv_actual = df_test[OUTCOME_COL].values.astype(float)

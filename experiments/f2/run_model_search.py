@@ -32,18 +32,21 @@ from src.config import (
     CAT_RX, CONT_RX, DATA_CSV, F1_MODEL_PATH, FEATURE_INFO_PATH,
     OUTCOME_COL, PATIENT_ID_COL, SEED, TRAIN_FRAC, VAL_FRAC, TEST_FRAC,
 )
-from src.data.preprocessor import load_feature_info, patient_split, validate_columns
+from src.data.preprocessor import (
+    load_feature_info, patient_split, validate_columns,
+    build_lag_features, drop_first_visits, lag_feature_names,
+)
 from src.utils.results_io import result_exists, save_result
 
 np.random.seed(SEED)
 
-RESULTS_PATH = "results/f2/model_search.json"
-REPORT_PATH  = "results/f2/model_search_report.txt"
-CKPT_DIR     = "results/f2/checkpoints"
+RESULTS_PATH = "results/f2_lag/model_search.json"
+REPORT_PATH  = "results/f2_lag/model_search_report.txt"
+CKPT_DIR     = "results/f2_lag/checkpoints"
 MIN_PEARSON  = 0.70   # clinical realism floor
 
-# Phase 1: all Stage A options, fixed MLP Stage B
-STAGE_A_TYPES = ["catboost", "xgboost", "rf", "linear", "mlp_nn", "transformer_nn"]
+# Phase 1: all Stage A options, fixed Residual Stage B
+STAGE_A_TYPES = ["catboost", "xgboost", "rf", "linear"]
 
 # Phase 2: all Stage B options, fixed best Stage A
 STAGE_B_TYPES = ["mlp", "deep_mlp", "residual", "transformer"]
@@ -96,7 +99,7 @@ def best_from_results(key_prefix: str) -> str:
 
 
 def run_combo(label, sa_type, sb_type, df_train, df_val, df_test,
-              feature_info, f1_model, device):
+              feature_info, f1_model, device, lag_cols):
     from src.training.f2_core import run_f2_pipeline
 
     if result_exists(RESULTS_PATH, label):
@@ -114,6 +117,7 @@ def run_combo(label, sa_type, sb_type, df_train, df_val, df_test,
             label=label,
             stage_a_type=sa_type,
             stage_b_type=sb_type,
+            lag_cols=lag_cols,
         )
         save_result(RESULTS_PATH, label, {
             **metrics,
@@ -142,12 +146,20 @@ def main():
     df_raw       = pd.read_csv(DATA_CSV)
     feature_info = load_feature_info(FEATURE_INFO_PATH)
     orig_features = feature_info["original_feature_names"]
-    validate_columns(df_raw, orig_features + [OUTCOME_COL, PATIENT_ID_COL], "model_search")
+    validate_columns(df_raw, orig_features + [OUTCOME_COL, PATIENT_ID_COL, "記錄時間"], "model_search")
 
     df_use = df_raw[list(dict.fromkeys(
-        [PATIENT_ID_COL, OUTCOME_COL] + orig_features + CONT_RX + [CAT_RX]
+        [PATIENT_ID_COL, "記錄時間", OUTCOME_COL] + orig_features + CONT_RX + [CAT_RX]
     ))].copy()
     df_use = df_use.loc[:, ~df_use.columns.duplicated()]
+
+    # ── Build lag features and drop first visits ──────────────────────────────
+    print("Building lag features ...")
+    df_use = build_lag_features(df_use)
+    n_before = len(df_use)
+    df_use   = drop_first_visits(df_use)
+    print(f"  Dropped {n_before - len(df_use)} first-visit rows  ({len(df_use)} remaining)")
+    lag_cols = lag_feature_names()
 
     df_train, df_val, df_test = patient_split(
         df_use, PATIENT_ID_COL, TRAIN_FRAC, VAL_FRAC, TEST_FRAC)
@@ -155,15 +167,15 @@ def main():
 
     f1_model = load_f1(feature_info, device)
 
-    # ── Phase 1: Stage A search (Stage B = MLP) ───────────────────────────
+    # ── Phase 1: Stage A search (Stage B = residual) ─────────────────────────
     print("\n" + "="*60)
-    print("PHASE 1: Stage A search  (Stage B fixed = mlp)")
+    print("PHASE 1: Stage A search  (Stage B fixed = residual)")
     print("="*60)
 
     for sa_type in STAGE_A_TYPES:
-        label = f"p1_{sa_type}_mlp"
-        run_combo(label, sa_type, "mlp",
-                  df_train, df_val, df_test, feature_info, f1_model, device)
+        label = f"p1_{sa_type}_residual"
+        run_combo(label, sa_type, "residual",
+                  df_train, df_val, df_test, feature_info, f1_model, device, lag_cols)
 
     best_sa_label = best_from_results("p1_")
     if best_sa_label is None:
@@ -184,17 +196,17 @@ def main():
     print("="*60)
 
     for sb_type in STAGE_B_TYPES:
-        if sb_type == "mlp":
-            # Already ran as p1_{best_sa_type}_mlp — copy result to avoid retraining
-            src_label = f"p1_{best_sa_type}_mlp"
-            dst_label = f"p2_{best_sa_type}_mlp"
+        if sb_type == "residual":
+            # Already ran as p1_{best_sa_type}_residual — copy to avoid retraining
+            src_label = f"p1_{best_sa_type}_residual"
+            dst_label = f"p2_{best_sa_type}_residual"
             if not result_exists(RESULTS_PATH, dst_label) and \
                result_exists(RESULTS_PATH, src_label):
                 save_result(RESULTS_PATH, dst_label, data[src_label])
             continue
         label = f"p2_{best_sa_type}_{sb_type}"
         run_combo(label, best_sa_type, sb_type,
-                  df_train, df_val, df_test, feature_info, f1_model, device)
+                  df_train, df_val, df_test, feature_info, f1_model, device, lag_cols)
 
     # ── Final report ──────────────────────────────────────────────────────
     _write_report(best_sa_type)
