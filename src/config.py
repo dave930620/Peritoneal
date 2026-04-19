@@ -45,6 +45,32 @@ EXCLUDE_COLUMNS = [
     "Fluid Exchange System",         # Collinear with long term PD system; not independently predictive
     "Volume (L)",                    # REMOVED: unreliable prescription artifact (夜間灌注量)
                                      # Contains many zeros and inconsistent recording
+    # ── PET (Peritoneal Equilibration Test) measurements ─────────────────────
+    # These are performed infrequently (not every visit) and are NOT available
+    # at routine follow-up. Including them would create a data-availability
+    # mismatch between training and real-world deployment.
+    "0Hr dialysate Glucose",
+    "2Hr dialysate Glucose",
+    "4Hr dialysate Glucose",
+    "0Hr dialysate Creatinine",
+    "2Hr dialysate Creatinine",
+    "4Hr dialysate Creatinine",
+    "0Hr Glucose D/D0",
+    "2Hr Glucose D/D0",
+    "4Hr Glucose D/D0",
+    "0Hr Creatinine D/P",
+    "2Hr Creatinine D/P",
+    "4Hr Creatinine D/P",
+    # ── 24-hour collection measurements ──────────────────────────────────────
+    # 24hr dialysate BUN/Cr and urine BUN/Cr are DIRECT inputs to the Kt/V
+    # calculation formula. Including them constitutes target leakage.
+    # 24hr fluid/urine volumes are also part of the clearance calculation.
+    "24 hr dialysate fluid(L)",
+    "24 hr urine",
+    "24 hr dialysate BUN(mg/dl)",
+    "24 hr urine BUN(mg/dl)",
+    "24 hr dialysate Cr(mg/dl)",
+    "24hr urine Cr(mg/dl)",
 ]
 
 # =============================================================================
