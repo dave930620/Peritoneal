@@ -33,11 +33,14 @@ from pathlib import Path
 from src.config import (
     CLINICAL_THRESHOLD, DATA_CSV, F1_MODEL_PATH, FEATURE_INFO_PATH,
     F1_HIDDEN_SIZE, F1_NUM_HEADS, F1_NUM_LAYERS, F1_DROPOUT, F1_OUTPUT_SIZE,
-    OUTCOME_COL, PATIENT_ID_COL,
+    OUTCOME_COL, PATIENT_ID_COL, CONT_RX, CAT_RX,
 )
 from src.data.preprocessor import load_feature_info, standardize_like_f1
 
 FIG_DIR = "results/figures"
+
+# All prescription feature names (continuous + categorical)
+RX_COLS = CONT_RX + [CAT_RX]
 
 
 def load_data_and_model():
@@ -169,7 +172,164 @@ def main():
         except Exception as e:
             print(f"  Waterfall for {tag} failed: {e}")
 
+    # ── Prescription-focused SHAP analysis ───────────────────────────────────
+    plot_prescription_shap(shap_values, X_te_np, feature_names, y_test)
+
     print("\nSHAP analysis complete.")
+
+
+def plot_prescription_shap(
+    shap_values: np.ndarray,
+    X_te_np: np.ndarray,
+    feature_names: list,
+    y_test: np.ndarray,
+) -> None:
+    """Three-panel prescription SHAP analysis.
+
+    1. Beeswarm  — prescription features only, shows direction and magnitude
+    2. Bar chart — mean |SHAP| for each prescription feature, with global rank
+    3. Dependence plots — one per prescription feature: SHAP value vs feature value
+
+    The goal is to answer: do prescription variables matter for Kt/V prediction,
+    and in which direction does each one push the prediction?
+    """
+    import shap
+
+    # Find which column indices correspond to prescription features
+    rx_indices = [
+        (i, name) for i, name in enumerate(feature_names) if name in RX_COLS
+    ]
+    if not rx_indices:
+        print("  [prescription SHAP] No prescription features found in feature_names — skipping.")
+        return
+
+    rx_idx   = [i for i, _ in rx_indices]
+    rx_names = [n for _, n in rx_indices]
+
+    shap_rx = shap_values[:, rx_idx]   # (N, n_rx)
+    X_rx    = X_te_np[:, rx_idx]       # (N, n_rx)
+
+    # ── (A) Prescription beeswarm ────────────────────────────────────────────
+    print("Plotting prescription beeswarm ...")
+    plt.figure(figsize=(9, max(4, len(rx_names) * 0.55)))
+    shap.summary_plot(shap_rx, X_rx, feature_names=rx_names,
+                      show=False, plot_size=None)
+    plt.title("SHAP Summary — Prescription Features Only\n"
+              "(each dot = one patient; color = feature value)")
+    plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/shap_rx_beeswarm.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  → {FIG_DIR}/shap_rx_beeswarm.png")
+
+    # ── (B) Prescription bar with global rank annotation ────────────────────
+    print("Plotting prescription importance bar ...")
+    mean_abs_shap_all = np.abs(shap_values).mean(axis=0)   # all features
+    mean_abs_shap_rx  = np.abs(shap_rx).mean(axis=0)        # prescription only
+    sorted_rx         = sorted(
+        zip(rx_names, mean_abs_shap_rx, rx_idx),
+        key=lambda x: x[1], reverse=True,
+    )
+    names_s  = [x[0] for x in sorted_rx]
+    shap_s   = [x[1] for x in sorted_rx]
+    # Global rank among ALL features (1 = most important overall)
+    global_ranks = np.argsort(mean_abs_shap_all)[::-1]
+    rank_map = {feat_idx: rank + 1 for rank, feat_idx in enumerate(global_ranks)}
+    ranks_s  = [rank_map[x[2]] for x in sorted_rx]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(names_s) * 0.5)))
+    bars = ax.barh(names_s[::-1], shap_s[::-1], color="#1f77b4", alpha=0.85)
+    for bar, rank in zip(bars, ranks_s[::-1]):
+        ax.text(
+            bar.get_width() + max(shap_s) * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f"rank #{rank}",
+            va="center", ha="left", fontsize=8, color="#555555",
+        )
+    ax.set_xlabel("Mean |SHAP value| (impact on Kt/V prediction)")
+    ax.set_title("Prescription Feature Importance\n(number = global rank among all features)")
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/shap_rx_bar.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  → {FIG_DIR}/shap_rx_bar.png")
+
+    # ── (C) Dependence plots — SHAP value vs feature value per prescription col
+    print("Plotting prescription dependence plots ...")
+    n_rx  = len(rx_names)
+    ncols = min(3, n_rx)
+    nrows = (n_rx + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(5 * ncols, 4 * nrows),
+                             squeeze=False)
+    for ax_idx, (col_name, col_shap, col_feat) in enumerate(
+        zip(rx_names, shap_rx.T, X_rx.T)
+    ):
+        row, col = divmod(ax_idx, ncols)
+        ax = axes[row][col]
+        sc = ax.scatter(col_feat, col_shap,
+                        c=col_shap, cmap="RdBu_r",
+                        alpha=0.6, s=18, linewidths=0)
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xlabel(f"{col_name}\n(z-score)")
+        ax.set_ylabel("SHAP value")
+        ax.set_title(col_name, fontsize=9)
+        plt.colorbar(sc, ax=ax, label="SHAP")
+    # Hide empty subplots
+    for ax_idx in range(n_rx, nrows * ncols):
+        row, col = divmod(ax_idx, ncols)
+        axes[row][col].set_visible(False)
+    fig.suptitle(
+        "SHAP Dependence — Prescription Features\n"
+        "(x = feature value after z-score; y = contribution to Kt/V prediction;\n"
+        " red = pushes prediction up, blue = pushes prediction down)",
+        fontsize=10,
+    )
+    plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/shap_rx_dependence.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  → {FIG_DIR}/shap_rx_dependence.png")
+
+    # ── (D) Prescription vs non-prescription importance summary ─────────────
+    print("Plotting prescription vs non-prescription importance summary ...")
+    rx_set      = set(RX_COLS)
+    is_rx       = np.array([n in rx_set for n in feature_names])
+    total_shap  = mean_abs_shap_all.sum()
+    rx_shap_pct = mean_abs_shap_all[is_rx].sum() / total_shap * 100
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Left: pie chart of prescription vs other
+    ax = axes[0]
+    wedge_vals  = [mean_abs_shap_all[is_rx].sum(),
+                   mean_abs_shap_all[~is_rx].sum()]
+    wedge_lbls  = [f"Prescription\n({rx_shap_pct:.1f}%)",
+                   f"Non-prescription\n({100 - rx_shap_pct:.1f}%)"]
+    ax.pie(wedge_vals, labels=wedge_lbls, colors=["#e74c3c", "#3498db"],
+           autopct="%1.1f%%", startangle=90,
+           wedgeprops=dict(edgecolor="white", linewidth=1.5))
+    ax.set_title("Share of Total SHAP Importance\n(Prescription vs All Other Features)")
+
+    # Right: top-20 global bar with prescription cols highlighted
+    ax = axes[1]
+    top20_idx   = np.argsort(mean_abs_shap_all)[-20:][::-1]
+    top20_names = [feature_names[i] for i in top20_idx]
+    top20_vals  = mean_abs_shap_all[top20_idx]
+    top20_colors = ["#e74c3c" if n in rx_set else "#3498db" for n in top20_names]
+    ax.barh(top20_names[::-1], top20_vals[::-1],
+            color=top20_colors[::-1], alpha=0.85)
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color="#e74c3c", label="Prescription"),
+                        Patch(color="#3498db", label="Other")],
+              loc="lower right")
+    ax.set_xlabel("Mean |SHAP value|")
+    ax.set_title("Top 20 Features — Prescription Highlighted")
+    ax.spines[["top", "right"]].set_visible(False)
+
+    plt.suptitle("Prescription Feature Contribution to Kt/V Prediction", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/shap_rx_vs_other.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  → {FIG_DIR}/shap_rx_vs_other.png")
 
 
 if __name__ == "__main__":
