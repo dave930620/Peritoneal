@@ -547,7 +547,7 @@ class TabMBaseline(_BaselineWrapper):
 
 def _read_tabpfn_key_from_disk() -> str:
     """Return the TabPFN API key from disk, or '' if not found."""
-    import json
+    import os, json
     candidates = []
     try:
         import platformdirs
