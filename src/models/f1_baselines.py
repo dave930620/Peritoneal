@@ -554,6 +554,13 @@ class TabPFNBaseline(_BaselineWrapper):
     Tabular Classification Problems in a Second," ICLR 2023.
     TabPFNRegressor available in tabpfn>=2.0.
 
+    Authentication
+    --------------
+    Set the environment variable TABPFN_API_KEY to your API key to skip
+    the browser login flow entirely (required on Windows):
+        set TABPFN_API_KEY=your_key_here   (Windows CMD)
+        $env:TABPFN_API_KEY="your_key"     (Windows PowerShell)
+
     Notes
     -----
     TabPFN processes the entire training set as context at inference time.
@@ -564,6 +571,7 @@ class TabPFNBaseline(_BaselineWrapper):
 
     def __init__(self, n_estimators: int = 8, seed: int = 42,
                  max_train: int = 10_000):
+        import os
         try:
             from tabpfn import TabPFNRegressor  # requires tabpfn>=2.0
         except ImportError:
@@ -571,6 +579,25 @@ class TabPFNBaseline(_BaselineWrapper):
                 "TabPFN regressor requires tabpfn>=2.0.\n"
                 "Install with: pip install tabpfn>=2.0"
             )
+
+        # Inject API key before constructing the model so TabPFN never
+        # attempts the interactive browser/socket login flow.
+        api_key = os.environ.get("TABPFN_API_KEY", "").strip()
+        if api_key:
+            try:
+                import tabpfn.config as _tfc
+                _tfc.g_tabpfn_config.api_key = api_key
+            except Exception:
+                pass  # older API path — the env-var alone may suffice
+            print(f"[TabPFN] Using API key from TABPFN_API_KEY env var.")
+        else:
+            print(
+                "[TabPFN] WARNING: TABPFN_API_KEY not set.\n"
+                "  On Windows this causes a socket crash. Set it with:\n"
+                "    PowerShell : $env:TABPFN_API_KEY='your_key'\n"
+                "    CMD        : set TABPFN_API_KEY=your_key"
+            )
+
         self._model     = TabPFNRegressor(n_estimators=n_estimators,
                                           random_state=seed)
         self._max_train = max_train
