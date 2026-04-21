@@ -11,6 +11,13 @@ After running this once, TabPFN will authenticate silently on every future run.
 import sys
 import os
 import json
+import asyncio
+
+# Fix Windows asyncio event loop before anything touches sockets.
+# Python 3.8+ defaults to ProactorEventLoop which breaks TabPFN's
+# localhost OAuth callback server (WinError 10038).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def main():

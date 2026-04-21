@@ -611,8 +611,15 @@ class TabPFNBaseline(_BaselineWrapper):
                 "Install with: pip install tabpfn>=2.0"
             )
 
-        # Load API key: env var → config.json on disk → fail loudly.
-        # Run setup_tabpfn_key.py once to write the key to disk.
+        # ── Fix Windows asyncio event loop FIRST ────────────────────────────
+        # Python 3.8+ uses ProactorEventLoop on Windows by default, which
+        # breaks TabPFN's localhost OAuth callback server (WinError 10038).
+        # Switching to SelectorEventLoop fixes the socket behaviour.
+        import sys, asyncio
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+        # ── Load API key: env var → config.json on disk → fail loudly ───────
         api_key = os.environ.get("TABPFN_API_KEY", "").strip()
         if not api_key:
             api_key = _read_tabpfn_key_from_disk()
@@ -661,7 +668,10 @@ _REGISTRY = {
 
 BASELINE_ORDER = [
     "ridge", "random_forest", "xgboost", "catboost",
-    "vanilla_mlp", "tabnet", "ft_transformer", "tabm", "tabpfn",
+    "vanilla_mlp", "tabnet", "ft_transformer", "tabm",
+    # "tabpfn",  # excluded: TabPFN v2 auth uses a localhost callback server
+    #             # that crashes on Windows (WinError 10038). Run on Linux/macOS
+    #             # or use setup_tabpfn_key.py on a supported platform.
 ]
 
 
