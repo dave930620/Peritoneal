@@ -543,6 +543,37 @@ class TabMBaseline(_BaselineWrapper):
 
 # ── B9: TabPFN (Hollmann et al., 2022 / v2 2025) ─────────────────────────────
 #
+# Helper: read API key from the config.json that setup_tabpfn_key.py wrote.
+
+def _read_tabpfn_key_from_disk() -> str:
+    """Return the TabPFN API key from disk, or '' if not found."""
+    import json
+    candidates = []
+    try:
+        import platformdirs
+        candidates.append(
+            os.path.join(platformdirs.user_data_dir("tabpfn", "priorlabs"), "config.json")
+        )
+    except Exception:
+        pass
+    candidates += [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "priorlabs", "tabpfn", "config.json"),
+        os.path.join(os.environ.get("APPDATA", ""),      "priorlabs", "tabpfn", "config.json"),
+        os.path.join(os.path.expanduser("~"), ".tabpfn", "config.json"),
+    ]
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            key = data.get("api_key", "").strip()
+            if key:
+                return key
+        except Exception:
+            continue
+    return ""
+#
 # TabPFN is a Prior-Data Fitted Network trained once on synthetic data and then
 # applied to new tasks via in-context learning — no per-dataset training needed.
 # Requires: pip install tabpfn>=2.0   (v2 introduces TabPFNRegressor)
@@ -580,24 +611,13 @@ class TabPFNBaseline(_BaselineWrapper):
                 "Install with: pip install tabpfn>=2.0"
             )
 
-        # Inject API key before constructing the model so TabPFN never
-        # attempts the interactive browser/socket login flow.
-        # Run setup_tabpfn_key.py once to persist the key to disk.
+        # Load API key: env var → config.json on disk → fail loudly.
+        # Run setup_tabpfn_key.py once to write the key to disk.
         api_key = os.environ.get("TABPFN_API_KEY", "").strip()
         if not api_key:
-            # Also check tabpfn's own credential store before giving up
-            try:
-                from tabpfn.utils.user_data_client import UserDataClient
-                api_key = UserDataClient().get_api_key() or ""
-            except Exception:
-                pass
+            api_key = _read_tabpfn_key_from_disk()
         if api_key:
-            os.environ["TABPFN_API_KEY"] = api_key  # ensure child processes see it
-            try:
-                import tabpfn.utils.user_data_client as _udc
-                _udc.UserDataClient().save_api_key(api_key)
-            except Exception:
-                pass
+            os.environ["TABPFN_API_KEY"] = api_key
             print("[TabPFN] API key loaded — skipping browser auth.")
         else:
             raise RuntimeError(
