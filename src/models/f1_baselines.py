@@ -668,10 +668,7 @@ _REGISTRY = {
 
 BASELINE_ORDER = [
     "ridge", "random_forest", "xgboost", "catboost",
-    "vanilla_mlp", "tabnet", "ft_transformer", "tabm",
-    # "tabpfn",  # excluded: TabPFN v2 auth uses a localhost callback server
-    #             # that crashes on Windows (WinError 10038). Run on Linux/macOS
-    #             # or use setup_tabpfn_key.py on a supported platform.
+    "vanilla_mlp", "tabnet", "ft_transformer", "tabm", "tabpfn",
 ]
 
 
