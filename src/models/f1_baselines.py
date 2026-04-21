@@ -582,20 +582,29 @@ class TabPFNBaseline(_BaselineWrapper):
 
         # Inject API key before constructing the model so TabPFN never
         # attempts the interactive browser/socket login flow.
+        # Run setup_tabpfn_key.py once to persist the key to disk.
         api_key = os.environ.get("TABPFN_API_KEY", "").strip()
-        if api_key:
+        if not api_key:
+            # Also check tabpfn's own credential store before giving up
             try:
-                import tabpfn.config as _tfc
-                _tfc.g_tabpfn_config.api_key = api_key
+                from tabpfn.utils.user_data_client import UserDataClient
+                api_key = UserDataClient().get_api_key() or ""
             except Exception:
-                pass  # older API path — the env-var alone may suffice
-            print(f"[TabPFN] Using API key from TABPFN_API_KEY env var.")
+                pass
+        if api_key:
+            os.environ["TABPFN_API_KEY"] = api_key  # ensure child processes see it
+            try:
+                import tabpfn.utils.user_data_client as _udc
+                _udc.UserDataClient().save_api_key(api_key)
+            except Exception:
+                pass
+            print("[TabPFN] API key loaded — skipping browser auth.")
         else:
-            print(
-                "[TabPFN] WARNING: TABPFN_API_KEY not set.\n"
-                "  On Windows this causes a socket crash. Set it with:\n"
-                "    PowerShell : $env:TABPFN_API_KEY='your_key'\n"
-                "    CMD        : set TABPFN_API_KEY=your_key"
+            raise RuntimeError(
+                "TabPFN API key not found.\n"
+                "Run this ONCE to save your key:\n"
+                "    python setup_tabpfn_key.py YOUR_API_KEY\n"
+                "Get your key at: https://ux.priorlabs.ai/account/licenses"
             )
 
         self._model     = TabPFNRegressor(n_estimators=n_estimators,
