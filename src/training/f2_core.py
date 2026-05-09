@@ -233,7 +233,8 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         for col in CONT_RX:
             m = CatBoostRegressor(
                 iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
-                depth=CATBOOST_DEPTH, loss_function="RMSE", random_seed=seed, verbose=0,
+                depth=4, l2_leaf_reg=15,
+                loss_function="RMSE", random_seed=seed, verbose=0,
             )
             m.fit(df_tr[patient_cols], df_tr[col],
                   eval_set=(df_va[patient_cols], df_va[col]),
@@ -241,7 +242,8 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
             models[col] = m
         m_cat = CatBoostClassifier(
             iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
-            depth=CATBOOST_DEPTH, loss_function="MultiClass", random_seed=seed, verbose=0,
+            depth=4, l2_leaf_reg=15,
+            loss_function="MultiClass", random_seed=seed, verbose=0,
         )
         m_cat.fit(df_tr[patient_cols], df_tr[CAT_RX].astype(int),
                   eval_set=(df_va[patient_cols], df_va[CAT_RX].astype(int)),
@@ -285,15 +287,18 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
     # ── Random Forest ─────────────────────────────────────────────────────────
     elif model_type == "rf":
         from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+        # With ~244 patient-level training rows and 105 features, deep trees
+        # memorise training patients. max_depth=4 (≤16 leaves) and
+        # min_samples_leaf=15 (~6% of data per leaf) force generalisation.
         for col in CONT_RX:
             m = RandomForestRegressor(
-                n_estimators=300, max_depth=12, min_samples_leaf=5,
+                n_estimators=500, max_depth=4, min_samples_leaf=15,
                 random_state=seed, n_jobs=-1,
             )
             m.fit(X_tr, df_tr[col].values)
             models[col] = m
         m_cat = RandomForestClassifier(
-            n_estimators=300, max_depth=12, min_samples_leaf=5,
+            n_estimators=500, max_depth=4, min_samples_leaf=15,
             random_state=seed, n_jobs=-1,
         )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
@@ -311,8 +316,8 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         for col in CONT_RX:
             m = lgb.LGBMRegressor(
                 n_estimators=800, learning_rate=0.02,
-                num_leaves=63, min_child_samples=20,
-                reg_lambda=5.0, subsample=0.8, colsample_bytree=0.8,
+                num_leaves=15, min_child_samples=20,
+                reg_lambda=20.0, subsample=0.8, colsample_bytree=0.8,
                 random_state=seed, verbose=-1, n_jobs=-1,
             )
             m.fit(X_tr, df_tr[col].values)   # no eval_set → full 800 rounds
@@ -429,16 +434,6 @@ def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict,
         step = STEP_MAP[col]
         cont[:, j] = np.round(raw / step) * step
     cat = stage_a_models[CAT_RX].predict(X).astype(np.int64).flatten()
-
-    # Clinical constraint: CAPD (class 0) never has nighttime PD.
-    # Zero out nighttime variables for predicted CAPD rows.
-    # (99.8% of actual CAPD rows already have 0; this fixes APD→CAPD misclassifications.)
-    _CAPD_ZERO = ["night time PD", "glucose_total_n", "calcium_total_n"]
-    capd_mask = cat == 0
-    for col in _CAPD_ZERO:
-        if col in CONT_RX:
-            cont[capd_mask, CONT_RX.index(col)] = 0.0
-
     return {"cont": cont, "cat": cat}
 
 
