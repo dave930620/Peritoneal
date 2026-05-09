@@ -62,7 +62,7 @@ from src.config import (
     OUTCOME_COL, PATIENT_ID_COL, SEED, STEP_MAP, TEST_FRAC, TRAIN_FRAC, VAL_FRAC,
 )
 from src.data.preprocessor import (
-    RxDataset, load_feature_info, patient_split,
+    RxDataset, load_feature_info, patient_split, remove_outlier_patients,
     sanity_check_data, standardize_like_f1, validate_columns,
 )
 from src.models.f2_head import F2RxHead
@@ -260,11 +260,15 @@ def main(args: argparse.Namespace) -> None:
         return f1_predict_raw(df_part, feature_info, f1_model, device)
 
     # ------------------------------------------------------------------
-    # 3. Patient-wise split
+    # 3. Patient-wise split (outliers removed before split)
     # ------------------------------------------------------------------
     cols_needed = [PATIENT_ID_COL, OUTCOME_COL] + orig_features
     df_use = df_raw[cols_needed].copy()
     df_use = df_use.loc[:, ~df_use.columns.duplicated()]
+
+    print("\n[F3] Removing outlier patients (>3σ in any prescription variable) ...")
+    df_use = remove_outlier_patients(df_use)
+
     tr, va, te = patient_split(df_use, PATIENT_ID_COL, TRAIN_FRAC, VAL_FRAC, TEST_FRAC)
 
     patient_cols = get_patient_feature_cols(feature_info)

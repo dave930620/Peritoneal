@@ -184,32 +184,105 @@ def patient_split(
     train_frac: float = 0.75,
     val_frac: float = 0.10,
     test_frac: float = 0.15,
+    stratify_col: str = CAT_RX,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Deterministic patient-wise split using hash bucketing.
+    """Deterministic patient-wise stratified split.
 
-    Ensures all records for a patient go to the same split,
-    preventing data leakage between train/val/test.
+    Patients are split within each stratum of stratify_col (majority value
+    per patient) so that CAPD/APD ratios are preserved across train/val/test.
+    All records for a patient always go to the same split.
     """
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-6, \
         "Split fractions must sum to 1.0"
 
-    pids = df[pid_col].astype(str).unique()
+    # Majority stratum per patient (handles patients who switched PD system)
+    pid_stratum = (
+        df.groupby(pid_col)[stratify_col]
+        .agg(lambda x: x.mode().iloc[0])
+        .to_dict()
+    )
 
-    def _bucket(pid: str) -> str:
-        h = int(hashlib.md5(pid.encode()).hexdigest(), 16)
-        v = (h % 10**9) / 10**9
-        if v < train_frac:
-            return "train"
-        if v < train_frac + val_frac:
-            return "val"
-        return "test"
+    def _assign_stratum(pids_in_stratum):
+        # Sort by MD5 hash for determinism, then assign proportionally
+        sorted_pids = sorted(
+            pids_in_stratum,
+            key=lambda p: int(hashlib.md5(str(p).encode()).hexdigest(), 16),
+        )
+        n = len(sorted_pids)
+        n_train = round(n * train_frac)
+        n_val   = round(n * val_frac)
+        assignment = {}
+        for i, pid in enumerate(sorted_pids):
+            if i < n_train:
+                assignment[pid] = "train"
+            elif i < n_train + n_val:
+                assignment[pid] = "val"
+            else:
+                assignment[pid] = "test"
+        return assignment
 
-    part = df[pid_col].astype(str).map(_bucket)
+    strata = set(pid_stratum.values())
+    pid_assignment: dict = {}
+    for s in sorted(strata):
+        pids_s = [p for p, v in pid_stratum.items() if v == s]
+        pid_assignment.update(_assign_stratum(pids_s))
+
+    part = df[pid_col].map(pid_assignment)
     tr = df[part == "train"].copy()
     va = df[part == "val"].copy()
     te = df[part == "test"].copy()
-    print(f"[Split] train={len(tr)} val={len(va)} test={len(te)} records")
+
+    capd_tr = (tr[stratify_col] == 0).mean()
+    capd_va = (va[stratify_col] == 0).mean()
+    capd_te = (te[stratify_col] == 0).mean()
+    print(f"[Split] train={len(tr)} ({tr[pid_col].nunique()} pts, CAPD={capd_tr:.1%}) "
+          f"val={len(va)} ({va[pid_col].nunique()} pts, CAPD={capd_va:.1%}) "
+          f"test={len(te)} ({te[pid_col].nunique()} pts, CAPD={capd_te:.1%})")
     return tr, va, te
+
+
+# ---------------------------------------------------------------------------
+# Outlier removal
+# ---------------------------------------------------------------------------
+
+def remove_outlier_patients(
+    df: pd.DataFrame,
+    cols: Optional[List[str]] = None,
+    sigma: float = 3.0,
+    pid_col: str = PATIENT_ID_COL,
+) -> pd.DataFrame:
+    """Remove patients whose per-patient mean exceeds sigma SDs from the
+    population mean in any of the specified columns.
+
+    Parameters
+    ----------
+    cols  : columns to check (defaults to CONT_RX)
+    sigma : z-score threshold (default 3.0)
+    """
+    if cols is None:
+        cols = CONT_RX
+
+    pat_means = df.groupby(pid_col)[cols].mean()
+    outlier_pids: set = set()
+    for col in cols:
+        mu, sd = pat_means[col].mean(), pat_means[col].std()
+        if sd < 1e-9:
+            continue
+        flagged = pat_means[col][pat_means[col] > mu + sigma * sd].index.tolist()
+        for pid in flagged:
+            print(f"  [Outlier] patient {pid}: {col}={pat_means.loc[pid, col]:.2f} "
+                  f"(mean={mu:.2f}, cutoff={mu + sigma*sd:.2f})")
+            outlier_pids.add(pid)
+
+    if outlier_pids:
+        n_before = df[pid_col].nunique()
+        df = df[~df[pid_col].isin(outlier_pids)].copy()
+        print(f"[Outlier removal] Removed {len(outlier_pids)} patients "
+              f"({n_before} → {df[pid_col].nunique()} patients, "
+              f"{len(df)} rows remain)")
+    else:
+        print("[Outlier removal] No outlier patients found.")
+    return df
 
 
 # ---------------------------------------------------------------------------
