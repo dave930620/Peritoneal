@@ -634,10 +634,14 @@ class TabPFNBaseline(_BaselineWrapper):
                 "Get your key at: https://ux.priorlabs.ai/account/licenses"
             )
 
+        # Force CPU to avoid MPS out-of-memory on Apple Silicon Macs.
+        # TabPFN is fast enough on CPU for datasets of this size.
         self._model     = TabPFNRegressor(n_estimators=n_estimators,
-                                          random_state=seed)
+                                          random_state=seed, device="cpu",
+                                          ignore_pretraining_limits=True)
         self._max_train = max_train
         self._seed      = seed
+        self._batch_size = 512
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         if len(X) > self._max_train:
@@ -649,7 +653,10 @@ class TabPFNBaseline(_BaselineWrapper):
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        return self._model.predict(X).flatten()
+        preds = []
+        for i in range(0, len(X), self._batch_size):
+            preds.append(self._model.predict(X[i:i + self._batch_size]))
+        return np.concatenate(preds).flatten()
 
 
 # ── Factory function ──────────────────────────────────────────────────────────

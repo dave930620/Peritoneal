@@ -22,5 +22,10 @@ pytorch-tabnet>=4.1.0    # TabNet (B6)
 # Interpretability (new)
 shap>=0.44.0
 
+# Baselines added for JBHI revision
+# tabpfn>=2.0        # TabPFN v2 — requires one-time browser auth; run on macOS/Linux
+#                    # Windows users: WinError 10038 prevents the auth callback server
+# tabm is implemented in pure PyTorch (no extra install needed)
+
 # Statistics (new)
 scipy>=1.11.0            # Wilcoxon test, bootstrap CI
