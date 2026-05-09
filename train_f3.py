@@ -322,7 +322,18 @@ def main(args: argparse.Namespace) -> None:
         hidden=F2_HIDDEN, dropout=F2_DROPOUT,
     ).to(device)
 
-    cfg       = make_cfg()
+    # F3-specific Stage B config:
+    # Stage A is weaker than F2 (no lag features, Pearson ~0.4–0.6 vs ~0.7+),
+    # so we widen the trust region and reduce the proximal pull to give Stage B
+    # more freedom to find prescriptions that improve Kt/V.
+    cfg = make_cfg({
+        "EPS_CONT_Z_PASS":  1.5,    # was 0.75 — PASS anchor less certain
+        "EPS_CONT_Z_FAIL":  4.5,    # was 3.00 — more exploration for FAIL cases
+        "EPS_CAT_SOFT_PASS": 0.25,  # was 0.15
+        "EPS_CAT_SOFT_FAIL": 0.50,  # was 0.35
+        "LAMBDA_PROX_CONT": 0.01,   # was 0.05 — weaker pull toward noisy anchor
+        "LAMBDA_PROX_CAT":  0.005,  # was 0.01
+    })
     ckpt_path = os.path.join(REPORT_DIR, "f3_stageB_best.pth")
     print("\n[F3] Stage B training ...")
     train_stage_B(model_b, dl_tr, dl_va, f1_model, feature_info,
@@ -341,7 +352,17 @@ def main(args: argparse.Namespace) -> None:
 
     # ------------------------------------------------------------------
     # 8. Evaluate + save
+    # Stage A alone baseline is printed first so you can quantify
+    # exactly how much Stage B adds on top of the anchor.
     # ------------------------------------------------------------------
+    rx_stage_a_val = pd.DataFrame({
+        **{col: teacher_va["cont"][:, j] for j, col in enumerate(CONT_RX)},
+        CAT_RX: teacher_va["cat"],
+    }, index=va.index)
+    print("\n--- Stage A alone (val) ---")
+    evaluate_and_save(va, rx_stage_a_val, "stageA_val", feature_info, f1_model, device)
+
+    print("\n--- Full pipeline Stage A + B (val) ---")
     evaluate_and_save(va, rx_val,  "val",  feature_info, f1_model, device)
     evaluate_and_save(te, rx_test, "test", feature_info, f1_model, device)
 
