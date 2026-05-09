@@ -387,10 +387,157 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         return {"_type": "nn", "_model": nn_model,
                 "_device": device, "_feature_info": feature_info}
 
+    # ── k-Nearest Neighbours ─────────────────────────────────────────────────
+    elif model_type == "knn":
+        from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.pipeline import Pipeline
+        k = 7
+        for col in CONT_RX:
+            m = Pipeline([("sc", _SS()),
+                          ("m", KNeighborsRegressor(n_neighbors=k,
+                                                    weights="distance"))])
+            m.fit(X_tr, df_tr[col].values)
+            models[col] = m
+        m_cat = Pipeline([("sc", _SS()),
+                          ("m", KNeighborsClassifier(n_neighbors=k,
+                                                     weights="distance"))])
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+        print(f"  [knn] k={k}")
+
+    # ── Lasso (per-column, automatic feature selection) ───────────────────────
+    elif model_type == "lasso":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.linear_model import LassoCV, LogisticRegressionCV
+        for col in CONT_RX:
+            m = Pipeline([("sc", _SS()),
+                          ("m", LassoCV(cv=5, max_iter=5000, random_state=seed))])
+            m.fit(X_tr, df_tr[col].values)
+            n_nz = int((m.named_steps["m"].coef_ != 0).sum())
+            print(f"  [lasso] {col}: alpha={m.named_steps['m'].alpha_:.4f}  features={n_nz}")
+            models[col] = m
+        m_cat = Pipeline([
+            ("sc", _SS()),
+            ("m", LogisticRegressionCV(Cs=[0.001, 0.01, 0.1, 1.0], penalty="l1",
+                                       solver="liblinear", max_iter=2000,
+                                       random_state=seed)),
+        ])
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── MultiTask Lasso (joint feature selection across all CONT_RX) ──────────
+    elif model_type == "multitask_lasso":
+        from sklearn.linear_model import MultiTaskLassoCV, LogisticRegressionCV
+        from sklearn.preprocessing import StandardScaler as _SS
+
+        class _MTLCol:
+            """Wraps a fitted MultiTaskLasso to behave like a single-output model."""
+            def __init__(self, sc, mtl, j):
+                self.sc, self.mtl, self.j = sc, mtl, j
+            def predict(self, X):
+                return self.mtl.predict(self.sc.transform(X))[:, self.j]
+
+        sc  = _SS().fit(X_tr)
+        Y_tr = df_tr[CONT_RX].values.astype(np.float64)
+        mtl = MultiTaskLassoCV(cv=5, max_iter=5000)
+        mtl.fit(sc.transform(X_tr), Y_tr)
+        n_nz = int((mtl.coef_ != 0).any(axis=0).sum())
+        print(f"  [multitask_lasso] alpha={mtl.alpha_:.4f}  shared_features={n_nz}")
+        for j, col in enumerate(CONT_RX):
+            models[col] = _MTLCol(sc, mtl, j)
+        m_cat = Pipeline([
+            ("sc", _SS()),
+            ("m", LogisticRegressionCV(Cs=[0.001, 0.01, 0.1, 1.0], penalty="l1",
+                                       solver="liblinear", max_iter=2000,
+                                       random_state=seed)),
+        ])
+        from sklearn.pipeline import Pipeline
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── PCA + RidgeCV ─────────────────────────────────────────────────────────
+    elif model_type == "pca_linear":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.decomposition import PCA
+        from sklearn.linear_model import RidgeCV, LogisticRegressionCV
+        n_comp = min(30, X_tr.shape[0] - 1, X_tr.shape[1])
+        _alphas = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+        print(f"  [pca_linear] n_components={n_comp}")
+        for col in CONT_RX:
+            m = Pipeline([("sc", _SS()), ("pca", PCA(n_components=n_comp)),
+                          ("m", RidgeCV(alphas=_alphas))])
+            m.fit(X_tr, df_tr[col].values)
+            models[col] = m
+        m_cat = Pipeline([("sc", _SS()), ("pca", PCA(n_components=n_comp)),
+                          ("m", LogisticRegressionCV(Cs=[0.001, 0.01, 0.1, 1.0, 10.0],
+                                                     max_iter=2000, random_state=seed))])
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── Gaussian Process (RBF kernel) ─────────────────────────────────────────
+    elif model_type == "gp":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.gaussian_process import GaussianProcessRegressor, GaussianProcessClassifier
+        from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+        reg_kernel = 1.0 * RBF(length_scale=1.0) + WhiteKernel(noise_level=1.0)
+        for col in CONT_RX:
+            m = Pipeline([
+                ("sc", _SS()),
+                ("gp", GaussianProcessRegressor(kernel=reg_kernel,
+                                                n_restarts_optimizer=1,
+                                                normalize_y=True,
+                                                random_state=seed)),
+            ])
+            m.fit(X_tr, df_tr[col].values)
+            print(f"  [gp] {col}: done")
+            models[col] = m
+        m_cat = Pipeline([
+            ("sc", _SS()),
+            ("gp", GaussianProcessClassifier(kernel=1.0 * RBF(),
+                                             n_restarts_optimizer=1,
+                                             random_state=seed)),
+        ])
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── Cluster-mean predictor ────────────────────────────────────────────────
+    elif model_type == "cluster":
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler as _SS
+
+        class _ClusterMean:
+            def __init__(self, sc, km, means):
+                self.sc, self.km, self.means = sc, km, means
+            def predict(self, X):
+                labels = self.km.predict(self.sc.transform(X))
+                return self.means[labels]
+
+        n_clusters = min(8, len(X_tr) // 5)
+        sc = _SS().fit(X_tr)
+        km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
+        km.fit(sc.transform(X_tr))
+        labels_tr = km.labels_
+        print(f"  [cluster] n_clusters={n_clusters}  "
+              f"sizes={np.bincount(labels_tr).tolist()}")
+        for col in CONT_RX:
+            means = np.array([df_tr[col].values[labels_tr == k].mean()
+                              for k in range(n_clusters)], dtype=np.float32)
+            models[col] = _ClusterMean(sc, km, means)
+        cat_modes = np.array([
+            int(np.bincount(df_tr[CAT_RX].astype(int).values[labels_tr == k]).argmax())
+            for k in range(n_clusters)
+        ])
+        models[CAT_RX] = _ClusterMean(sc, km, cat_modes)
+
     else:
         raise ValueError(
             f"Unknown model_type '{model_type}'. "
-            f"Choose: catboost, xgboost, lgbm, rf, linear, mlp_nn, transformer_nn")
+            f"Choose: catboost, xgboost, lgbm, rf, linear, mlp_nn, transformer_nn, "
+            f"knn, lasso, multitask_lasso, pca_linear, gp, cluster")
 
     return models
 

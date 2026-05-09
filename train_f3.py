@@ -133,7 +133,10 @@ def get_patient_feature_cols(feature_info: dict) -> list:
     return [c for c in feature_info["original_feature_names"] if c not in rx_cols]
 
 
-STAGE_A_TYPES = ["rf", "catboost", "xgboost", "lgbm", "linear", "mlp_nn", "transformer_nn"]
+STAGE_A_TYPES = [
+    "rf", "catboost", "xgboost", "lgbm", "linear", "mlp_nn", "transformer_nn",
+    "knn", "lasso", "multitask_lasso", "pca_linear", "gp", "cluster",
+]
 
 
 def print_stage_a_similarity(df_val, teacher_va: dict, label: str = "Stage A") -> dict:
@@ -525,7 +528,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--stageA",
-        choices=["catboost", "xgboost", "lgbm", "rf", "linear", "mlp_nn", "transformer_nn"],
+        choices=["catboost", "xgboost", "lgbm", "rf", "linear", "mlp_nn", "transformer_nn",
+                 "knn", "lasso", "multitask_lasso", "pca_linear", "gp", "cluster"],
         default=None,
         help=(
             "Stage A model type for flat mode. "
