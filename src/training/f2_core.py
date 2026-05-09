@@ -209,7 +209,8 @@ def _train_stage_A_nn(df_tr, df_va, feature_info: dict,
 
 def train_stage_A(df_tr, df_va, feature_info: dict,
                   model_type: str = "catboost", save_dir: str = "",
-                  lag_cols: Optional[list] = None) -> dict:
+                  lag_cols: Optional[list] = None,
+                  seed: int = SEED) -> dict:
     """Train Stage A doctor-mimic model.
 
     model_type : "catboost" | "xgboost" | "rf" | "linear"
@@ -232,7 +233,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         for col in CONT_RX:
             m = CatBoostRegressor(
                 iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
-                depth=CATBOOST_DEPTH, loss_function="RMSE", random_seed=SEED, verbose=0,
+                depth=CATBOOST_DEPTH, loss_function="RMSE", random_seed=seed, verbose=0,
             )
             m.fit(df_tr[patient_cols], df_tr[col],
                   eval_set=(df_va[patient_cols], df_va[col]),
@@ -240,7 +241,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
             models[col] = m
         m_cat = CatBoostClassifier(
             iterations=CATBOOST_ITERATIONS, learning_rate=CATBOOST_LR,
-            depth=CATBOOST_DEPTH, loss_function="MultiClass", random_seed=SEED, verbose=0,
+            depth=CATBOOST_DEPTH, loss_function="MultiClass", random_seed=seed, verbose=0,
         )
         m_cat.fit(df_tr[patient_cols], df_tr[CAT_RX].astype(int),
                   eval_set=(df_va[patient_cols], df_va[CAT_RX].astype(int)),
@@ -256,7 +257,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         for col in CONT_RX:
             m = XGBRegressor(
                 n_estimators=500, learning_rate=0.05, max_depth=6,
-                subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+                subsample=0.8, colsample_bytree=0.8, random_state=seed,
                 early_stopping_rounds=50, eval_metric="rmse", verbosity=0,
             )
             m.fit(X_tr, df_tr[col].values,
@@ -267,14 +268,14 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         if n_cat_cls == 2:
             m_cat = XGBClassifier(
                 n_estimators=500, learning_rate=0.05, max_depth=6,
-                subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+                subsample=0.8, colsample_bytree=0.8, random_state=seed,
                 objective="binary:logistic",
                 early_stopping_rounds=50, eval_metric="logloss", verbosity=0,
             )
         else:
             m_cat = XGBClassifier(
                 n_estimators=500, learning_rate=0.05, max_depth=6,
-                subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+                subsample=0.8, colsample_bytree=0.8, random_state=seed,
                 early_stopping_rounds=50, eval_metric="mlogloss", verbosity=0,
             )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values,
@@ -287,13 +288,13 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         for col in CONT_RX:
             m = RandomForestRegressor(
                 n_estimators=300, max_depth=12, min_samples_leaf=5,
-                random_state=SEED, n_jobs=-1,
+                random_state=seed, n_jobs=-1,
             )
             m.fit(X_tr, df_tr[col].values)
             models[col] = m
         m_cat = RandomForestClassifier(
             n_estimators=300, max_depth=12, min_samples_leaf=5,
-            random_state=SEED, n_jobs=-1,
+            random_state=seed, n_jobs=-1,
         )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
         models[CAT_RX] = m_cat
@@ -312,7 +313,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
                 n_estimators=800, learning_rate=0.02,
                 num_leaves=63, min_child_samples=20,
                 reg_lambda=5.0, subsample=0.8, colsample_bytree=0.8,
-                random_state=SEED, verbose=-1, n_jobs=-1,
+                random_state=seed, verbose=-1, n_jobs=-1,
             )
             m.fit(X_tr, df_tr[col].values)   # no eval_set → full 800 rounds
             models[col] = m
@@ -322,7 +323,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
             n_estimators=1000, learning_rate=0.02,
             num_leaves=63, min_child_samples=20,
             reg_lambda=3.0, subsample=0.8, colsample_bytree=0.8,
-            random_state=SEED, verbose=-1, n_jobs=-1,
+            random_state=seed, verbose=-1, n_jobs=-1,
         )
         m_cat.fit(
             X_tr, df_tr[CAT_RX].astype(int).values,
@@ -345,7 +346,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         m_cat = Pipeline([
             ("sc", _SS()),
             ("m", LogisticRegression(max_iter=1000, C=1.0,
-                                     multi_class="multinomial", random_state=SEED)),
+                                     multi_class="multinomial", random_state=seed)),
         ])
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
         models[CAT_RX] = m_cat

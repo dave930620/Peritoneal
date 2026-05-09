@@ -59,7 +59,7 @@ import torch.nn as nn
 from src.config import (
     CAT_RX, CLINICAL_THRESHOLD, CONT_RX, DATA_CSV, DELTA_WIN,
     F1_MODEL_PATH, F2_BATCH_SIZE, F2_DROPOUT, F2_HIDDEN, FEATURE_INFO_PATH,
-    OUTCOME_COL, PATIENT_ID_COL, SEED, STEP_MAP, TEST_FRAC, TRAIN_FRAC, VAL_FRAC,
+    OUTCOME_COL, PATIENT_ID_COL, SEED, STEP_MAP,
 )
 from src.data.preprocessor import (
     RxDataset, load_feature_info, patient_split, remove_outlier_patients,
@@ -271,7 +271,10 @@ def _prepare_data(args: argparse.Namespace):
     print("\n[F3] Removing outlier patients (>3σ in any prescription variable) ...")
     df_use = remove_outlier_patients(df_use)
 
-    tr, va, te = patient_split(df_use, PATIENT_ID_COL, TRAIN_FRAC, VAL_FRAC, TEST_FRAC)
+    # F3 uses 75/15/10 instead of the default 75/10/15:
+    # val needs more patients (32 → ~49) for stable Pearson estimates.
+    tr, va, te = patient_split(df_use, PATIENT_ID_COL,
+                               train_frac=0.75, val_frac=0.15, test_frac=0.10)
     patient_cols = get_patient_feature_cols(feature_info)
 
     return dict(
@@ -291,41 +294,69 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
     ctx = _prepare_data(args)
     tr, va, feature_info = ctx["tr"], ctx["va"], ctx["feature_info"]
 
-    summary: dict = {}   # model_type → {col: pearson, CAT_RX: acc}
+    n_runs = args.n_runs
+    # all_results[model_type] = list of per-run result dicts
+    all_results: dict = {m: [] for m in STAGE_A_TYPES}
 
     for model_type in STAGE_A_TYPES:
         print(f"\n{'='*60}")
-        print(f"[F3] Stage A — {model_type.upper()}")
-        try:
-            sa_models  = train_stage_A(tr, va, feature_info, model_type=model_type)
-            teacher_va = get_stage_A_preds(va, sa_models, feature_info)
-            result     = print_stage_a_similarity(va, teacher_va,
-                                                  label=f"Stage A ({model_type})")
-            summary[model_type] = result
-        except Exception as exc:
-            print(f"  [ERROR] {model_type} failed: {exc}")
-            summary[model_type] = None
+        print(f"[F3] Stage A — {model_type.upper()}  ({n_runs} run(s))")
+        for run_i in range(n_runs):
+            seed = SEED + run_i
+            print(f"  --- run {run_i+1}/{n_runs}  seed={seed} ---")
+            try:
+                sa_models  = train_stage_A(tr, va, feature_info,
+                                           model_type=model_type, seed=seed)
+                teacher_va = get_stage_A_preds(va, sa_models, feature_info)
+                result     = print_stage_a_similarity(
+                    va, teacher_va, label=f"Stage A ({model_type}, seed={seed})")
+                all_results[model_type].append(result)
+            except Exception as exc:
+                print(f"  [ERROR] run {run_i+1}: {exc}")
 
     # ------------------------------------------------------------------
-    # Comparison table
+    # Comparison table — mean ± std across runs
     # ------------------------------------------------------------------
-    short = {col: col[:9] for col in CONT_RX}
-    header = f"{'Model':15s}" + "".join(f"  {short[c]:>9s}" for c in CONT_RX) + f"  {'PD_acc':>6s}  {'Mean_r':>6s}"
-    print(f"\n{'='*len(header)}")
-    print("STAGE A COMPARISON — val-set Pearson (higher is better)")
+    short  = [col[:8] for col in CONT_RX]
+    col_w  = 14   # width per Pearson column  "0.3122±0.0234"
+    header = f"{'Model':15s}" + "".join(f"  {s:>{col_w}s}" for s in short) + f"  {'PD_acc':>13s}  {'Mean_r':>13s}"
+    div    = "=" * len(header)
+    print(f"\n{div}")
+    if n_runs > 1:
+        print(f"STAGE A COMPARISON — val-set Pearson  mean±std over {n_runs} seeds")
+    else:
+        print("STAGE A COMPARISON — val-set Pearson")
     print(header)
     print("-" * len(header))
-    for model_type, res in summary.items():
-        if res is None:
-            print(f"{model_type:15s}  ERROR")
+
+    for model_type in STAGE_A_TYPES:
+        runs = all_results[model_type]
+        if not runs:
+            print(f"{model_type:15s}  ERROR (all runs failed)")
             continue
-        mean_r = float(np.mean([res.get(c, float("nan")) for c in CONT_RX]))
         row = f"{model_type:15s}"
+        pearson_means = []
         for col in CONT_RX:
-            row += f"  {res.get(col, float('nan')):9.4f}"
-        row += f"  {res.get(CAT_RX, float('nan')):6.4f}  {mean_r:6.4f}"
+            vals = [r[col] for r in runs if col in r and not np.isnan(r[col])]
+            if vals:
+                mu, sd = float(np.mean(vals)), float(np.std(vals))
+                cell = f"{mu:.4f}±{sd:.4f}" if n_runs > 1 else f"{mu:.4f}"
+                pearson_means.append(mu)
+            else:
+                cell = "nan"
+            row += f"  {cell:>{col_w}s}"
+        # CAT_RX accuracy
+        cat_vals = [r[CAT_RX] for r in runs if CAT_RX in r]
+        if cat_vals:
+            cmu, csd = float(np.mean(cat_vals)), float(np.std(cat_vals))
+            cat_cell = f"{cmu:.4f}±{csd:.4f}" if n_runs > 1 else f"{cmu:.4f}"
+        else:
+            cat_cell = "nan"
+        mean_r = float(np.mean(pearson_means)) if pearson_means else float("nan")
+        row += f"  {cat_cell:>13s}  {mean_r:>13.4f}"
         print(row)
-    print(f"{'='*len(header)}")
+
+    print(div)
     print("\nRun `python train_f3.py --stageA <best_model>` for the full Stage A + B pipeline.")
 
 
@@ -462,6 +493,14 @@ if __name__ == "__main__":
             "Omit to benchmark ALL models (Stage A only, no Stage B). "
             "Specify one to run the full Stage A + B pipeline. "
             "Options: rf, catboost, xgboost, lgbm, linear, mlp_nn, transformer_nn."
+        ),
+    )
+    parser.add_argument(
+        "--n_runs", type=int, default=1, metavar="N",
+        help=(
+            "Number of times to train each Stage A model with different random seeds "
+            "(default: 1). Only applies to the comparison mode (no --stageA). "
+            "Use 5+ to measure variance across seeds."
         ),
     )
     parser.add_argument(
