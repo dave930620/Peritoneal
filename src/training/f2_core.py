@@ -284,18 +284,15 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
     # ── Random Forest ─────────────────────────────────────────────────────────
     elif model_type == "rf":
         from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-        # max_features="sqrt": ~10 features/split (vs all 105 with default 1.0),
-        # reduces tree correlation → stronger ensemble.
         for col in CONT_RX:
             m = RandomForestRegressor(
-                n_estimators=500, max_depth=12, min_samples_leaf=5,
-                max_features="sqrt", random_state=SEED, n_jobs=-1,
+                n_estimators=300, max_depth=12, min_samples_leaf=5,
+                random_state=SEED, n_jobs=-1,
             )
             m.fit(X_tr, df_tr[col].values)
             models[col] = m
         m_cat = RandomForestClassifier(
-            n_estimators=500, max_depth=12, min_samples_leaf=5,
-            max_features="sqrt", class_weight="balanced",
+            n_estimators=300, max_depth=12, min_samples_leaf=5,
             random_state=SEED, n_jobs=-1,
         )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
