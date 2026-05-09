@@ -295,9 +295,9 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train F3 first-visit prescription model")
     parser.add_argument(
-        "--mode", choices=["chain", "stratified"], default="chain",
+        "--mode", choices=["chain", "stratified"], default="stratified",
         help="Hierarchical Stage A mode. "
-             "'chain': append predicted PD system as feature (default, recommended). "
-             "'stratified': train separate models per PD system class.",
+             "'stratified': train separate models per PD system class (default, recommended). "
+             "'chain': append predicted PD system as feature.",
     )
     main(parser.parse_args())
