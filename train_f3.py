@@ -264,6 +264,37 @@ def _aggregate_patients(df: pd.DataFrame) -> pd.DataFrame:
 # Main
 # =============================================================================
 
+def _select_features(df_tr: pd.DataFrame, patient_cols: list, top_k: int) -> list:
+    """Select top_k features via MultiTaskLasso importance on training data only.
+
+    Importance = sum of |coef| across all CONT_RX targets.
+    Uses the same model that already performs best, so the selection is principled.
+    """
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import MultiTaskLassoCV
+
+    print(f"\n[FeatureSelect] Selecting top {top_k} / {len(patient_cols)} features "
+          f"via MultiTaskLasso ...")
+    X = df_tr[patient_cols].values.astype(np.float64)
+    Y = df_tr[CONT_RX].values.astype(np.float64)
+
+    sc  = StandardScaler().fit(X)
+    mtl = MultiTaskLassoCV(cv=5, max_iter=10000)
+    mtl.fit(sc.transform(X), Y)
+
+    # coef_ shape: (n_targets, n_features); sum |coef| across targets → importance per feature
+    importance = np.abs(mtl.coef_).sum(axis=0)
+    top_k      = min(top_k, len(patient_cols))
+    top_idx    = np.argsort(importance)[::-1][:top_k]
+    top_idx    = sorted(top_idx.tolist())          # keep original column order
+    selected   = [patient_cols[i] for i in top_idx]
+
+    print(f"  alpha={mtl.alpha_:.4f}  selected {len(selected)} features:")
+    for rank, i in enumerate(np.argsort(importance)[::-1][:top_k], 1):
+        print(f"    {rank:2d}. {patient_cols[i]:<45s}  importance={importance[i]:.4f}")
+    return selected
+
+
 def _prepare_data(args: argparse.Namespace):
     """Load data, F1 oracle, and split — shared across all Stage A runs."""
     set_seed(SEED)
@@ -312,6 +343,9 @@ def _prepare_data(args: argparse.Namespace):
         va = _aggregate_patients(va)
         te = _aggregate_patients(te)
         print(f"[F3] Patient-level: train={len(tr)} val={len(va)} test={len(te)} rows")
+
+    if getattr(args, "top_k", None):
+        patient_cols = _select_features(tr, patient_cols, args.top_k)
 
     return dict(
         tr=tr, va=va, te=te, df_use=df_use,
@@ -551,6 +585,11 @@ if __name__ == "__main__":
         "--no_patient_level", action="store_true",
         help="Disable patient-level aggregation (default: on). "
              "When off, models train on visit-level rows and overfit badly.",
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=None, metavar="K",
+        help="Select top K features via MultiTaskLasso importance before training "
+             "(e.g. --top_k 25). Default: use all features.",
     )
     parser.add_argument(
         "--oracle", action="store_true",

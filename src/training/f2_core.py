@@ -550,7 +550,8 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
             m = Pipeline([
                 ("sc", _SS()),
                 ("m", ElasticNetCV(l1_ratio=_l1_ratios, cv=5,
-                                   max_iter=10000, random_state=seed)),
+                                   max_iter=100000, tol=1e-3,
+                                   random_state=seed)),
             ])
             m.fit(X_tr, df_tr[col].values)
             est = m.named_steps["m"]
