@@ -284,15 +284,18 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
     # ── Random Forest ─────────────────────────────────────────────────────────
     elif model_type == "rf":
         from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+        # max_features="sqrt": ~10 features/split (vs all 105 with default 1.0),
+        # reduces tree correlation → stronger ensemble.
         for col in CONT_RX:
             m = RandomForestRegressor(
-                n_estimators=300, max_depth=12, min_samples_leaf=5,
-                random_state=SEED, n_jobs=-1,
+                n_estimators=500, max_depth=12, min_samples_leaf=5,
+                max_features="sqrt", random_state=SEED, n_jobs=-1,
             )
             m.fit(X_tr, df_tr[col].values)
             models[col] = m
         m_cat = RandomForestClassifier(
-            n_estimators=300, max_depth=12, min_samples_leaf=5,
+            n_estimators=500, max_depth=12, min_samples_leaf=5,
+            max_features="sqrt", class_weight="balanced",
             random_state=SEED, n_jobs=-1,
         )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
@@ -428,6 +431,16 @@ def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict,
         step = STEP_MAP[col]
         cont[:, j] = np.round(raw / step) * step
     cat = stage_a_models[CAT_RX].predict(X).astype(np.int64).flatten()
+
+    # Clinical constraint: CAPD (class 0) never has nighttime PD.
+    # Zero out nighttime variables for predicted CAPD rows.
+    # (99.8% of actual CAPD rows already have 0; this fixes APD→CAPD misclassifications.)
+    _CAPD_ZERO = ["night time PD", "glucose_total_n", "calcium_total_n"]
+    capd_mask = cat == 0
+    for col in _CAPD_ZERO:
+        if col in CONT_RX:
+            cont[capd_mask, CONT_RX.index(col)] = 0.0
+
     return {"cont": cont, "cat": cat}
 
 
