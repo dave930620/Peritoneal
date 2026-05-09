@@ -539,11 +539,66 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         ])
         models[CAT_RX] = _ClusterMean(sc, km, cat_modes)
 
+    # ── ElasticNet (L1 + L2 combined) ────────────────────────────────────────
+    # Beats pure Lasso when features are correlated; CV selects l1_ratio and alpha.
+    elif model_type == "elasticnet":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.linear_model import ElasticNetCV, LogisticRegressionCV
+        _l1_ratios = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0]
+        for col in CONT_RX:
+            m = Pipeline([
+                ("sc", _SS()),
+                ("m", ElasticNetCV(l1_ratio=_l1_ratios, cv=5,
+                                   max_iter=10000, random_state=seed)),
+            ])
+            m.fit(X_tr, df_tr[col].values)
+            est = m.named_steps["m"]
+            n_nz = int((est.coef_ != 0).sum())
+            print(f"  [elasticnet] {col}: alpha={est.alpha_:.4f}  "
+                  f"l1_ratio={est.l1_ratio_:.2f}  features={n_nz}")
+            models[col] = m
+        m_cat = Pipeline([
+            ("sc", _SS()),
+            ("m", LogisticRegressionCV(Cs=[0.001, 0.01, 0.1, 1.0], penalty="l1",
+                                       solver="liblinear", max_iter=2000,
+                                       random_state=seed)),
+        ])
+        m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        models[CAT_RX] = m_cat
+
+    # ── SVR with RBF kernel ───────────────────────────────────────────────────
+    # Margin-based regression; robust for small N / high-dim. CV over C and gamma.
+    elif model_type == "svr":
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.svm import SVR, SVC
+        from sklearn.model_selection import GridSearchCV
+        _param_grid = {"m__C": [0.1, 1.0, 10.0, 100.0],
+                       "m__gamma": ["scale", "auto"]}
+        for col in CONT_RX:
+            pipe = Pipeline([("sc", _SS()), ("m", SVR(kernel="rbf", max_iter=5000))])
+            gs = GridSearchCV(pipe, _param_grid, cv=5, scoring="r2", n_jobs=-1)
+            gs.fit(X_tr, df_tr[col].values)
+            best = gs.best_params_
+            print(f"  [svr] {col}: C={best['m__C']}  gamma={best['m__gamma']}  "
+                  f"val_r2={gs.best_score_:.4f}")
+            models[col] = gs.best_estimator_
+        svc_grid = {"m__C": [0.1, 1.0, 10.0], "m__gamma": ["scale", "auto"]}
+        svc_pipe = Pipeline([("sc", _SS()), ("m", SVC(kernel="rbf", probability=False,
+                                                       max_iter=5000))])
+        gs_cat = GridSearchCV(svc_pipe, svc_grid, cv=5, scoring="accuracy", n_jobs=-1)
+        gs_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
+        print(f"  [svr] {CAT_RX}: C={gs_cat.best_params_['m__C']}  "
+              f"gamma={gs_cat.best_params_['m__gamma']}  "
+              f"val_acc={gs_cat.best_score_:.4f}")
+        models[CAT_RX] = gs_cat.best_estimator_
+
     else:
         raise ValueError(
             f"Unknown model_type '{model_type}'. "
             f"Choose: catboost, xgboost, lgbm, rf, linear, mlp_nn, transformer_nn, "
-            f"knn, lasso, multitask_lasso, pca_linear, gp, cluster")
+            f"knn, lasso, multitask_lasso, pca_linear, gp, cluster, elasticnet, svr")
 
     return models
 

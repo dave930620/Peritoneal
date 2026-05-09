@@ -136,6 +136,7 @@ def get_patient_feature_cols(feature_info: dict) -> list:
 STAGE_A_TYPES = [
     "rf", "catboost", "xgboost", "lgbm", "linear", "mlp_nn", "transformer_nn",
     "knn", "lasso", "multitask_lasso", "pca_linear", "gp", "cluster",
+    "elasticnet", "svr",
 ]
 
 
