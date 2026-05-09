@@ -275,12 +275,8 @@ def main(args: argparse.Namespace) -> None:
     stage_a_hier = None   # kept for oracle evaluation if needed
 
     if args.mode == "flat":
-        # One CatBoost per Rx variable, no hierarchy.
-        # Identical to F2 Stage A without lag features — the strongest practical
-        # option given that PD-system type cannot be predicted reliably from
-        # clinical features alone.
-        print("\n[F3] Stage A — flat CatBoost (no lag features)")
-        sa_models  = train_stage_A(tr, va, feature_info, model_type="catboost")
+        print(f"\n[F3] Stage A — flat {args.stageA.upper()} (no lag features)")
+        sa_models  = train_stage_A(tr, va, feature_info, model_type=args.stageA)
         teacher_tr = get_stage_A_preds(tr, sa_models, feature_info)
         teacher_va = get_stage_A_preds(va, sa_models, feature_info)
         teacher_te = get_stage_A_preds(te, sa_models, feature_info)
@@ -298,7 +294,8 @@ def main(args: argparse.Namespace) -> None:
         teacher_te = stage_a_hier.predict(te, patient_cols)
 
     # Stage A val-set similarity
-    print_stage_a_similarity(va, teacher_va, label=f"Stage A ({args.mode})")
+    sa_label = f"Stage A (flat/{args.stageA})" if args.mode == "flat" else f"Stage A ({args.mode})"
+    print_stage_a_similarity(va, teacher_va, label=sa_label)
 
     # Oracle evaluation: shows upper bound when true class is always used
     if args.oracle and stage_a_hier is not None:
@@ -376,14 +373,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode", choices=["flat", "chain", "stratified"], default="flat",
         help=(
-            "'flat' (default): one CatBoost per Rx variable — recommended. "
+            "'flat' (default): one model per Rx variable — recommended. "
             "'stratified': separate models per PD-system class. "
             "'chain': predicted PD-system appended as extra feature."
         ),
     )
     parser.add_argument(
+        "--stageA",
+        choices=["catboost", "xgboost", "rf", "linear"],
+        default="catboost",
+        help=(
+            "Stage A model type for flat mode (default: catboost). "
+            "'rf' (Random Forest) has no early stopping — most stable when signal is weak. "
+            "'xgboost' is often slightly stronger than catboost on tabular data. "
+            "'linear' is the most interpretable baseline."
+        ),
+    )
+    parser.add_argument(
         "--oracle", action="store_true",
-        help="(stratified/chain only) Also evaluate with true class labels to "
-             "show the upper bound of hierarchical Stage A.",
+        help="(stratified/chain only) Evaluate with true class labels — "
+             "shows upper bound of hierarchical Stage A.",
     )
     main(parser.parse_args())
