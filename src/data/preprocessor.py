@@ -16,6 +16,7 @@ Design notes
   Stage B has a clinically-initialized proximal anchor.
 """
 
+import hashlib
 import pickle
 from typing import List, Optional, Tuple
 
@@ -195,7 +196,8 @@ def patient_split(
     pids = df[pid_col].astype(str).unique()
 
     def _bucket(pid: str) -> str:
-        v = (hash(pid) % 10**9) / 10**9
+        h = int(hashlib.md5(pid.encode()).hexdigest(), 16)
+        v = (h % 10**9) / 10**9
         if v < train_frac:
             return "train"
         if v < train_frac + val_frac:
