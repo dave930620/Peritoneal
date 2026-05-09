@@ -308,8 +308,12 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
                 sa_models  = train_stage_A(tr, va, feature_info,
                                            model_type=model_type, seed=seed)
                 teacher_va = get_stage_A_preds(va, sa_models, feature_info)
+                teacher_tr = get_stage_A_preds(tr, sa_models, feature_info)
                 result     = print_stage_a_similarity(
                     va, teacher_va, label=f"Stage A ({model_type}, seed={seed})")
+                tr_result  = print_stage_a_similarity(
+                    tr, teacher_tr, label=f"  TRAIN ({model_type}, seed={seed})")
+                result["_train"] = {c: tr_result[c] for c in CONT_RX}
                 all_results[model_type].append(result)
             except Exception as exc:
                 print(f"  [ERROR] run {run_i+1}: {exc}")
@@ -353,7 +357,10 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
         else:
             cat_cell = "nan"
         mean_r = float(np.mean(pearson_means)) if pearson_means else float("nan")
-        row += f"  {cat_cell:>13s}  {mean_r:>13.4f}"
+        tr_means = [float(np.mean([r["_train"][c] for r in runs if "_train" in r and c in r["_train"]]))
+                    for c in CONT_RX]
+        tr_mean_r = float(np.mean([v for v in tr_means if not np.isnan(v)])) if tr_means else float("nan")
+        row += f"  {cat_cell:>13s}  {mean_r:>7.4f} (tr:{tr_mean_r:.4f})"
         print(row)
 
     print(div)
