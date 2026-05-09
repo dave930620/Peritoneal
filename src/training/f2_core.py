@@ -429,6 +429,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
 
     # ── MultiTask Lasso (joint feature selection across all CONT_RX) ──────────
     elif model_type == "multitask_lasso":
+        from sklearn.pipeline import Pipeline
         from sklearn.linear_model import MultiTaskLassoCV, LogisticRegressionCV
         from sklearn.preprocessing import StandardScaler as _SS
 
@@ -441,7 +442,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
 
         sc  = _SS().fit(X_tr)
         Y_tr = df_tr[CONT_RX].values.astype(np.float64)
-        mtl = MultiTaskLassoCV(cv=5, max_iter=5000)
+        mtl = MultiTaskLassoCV(cv=5, max_iter=10000)
         mtl.fit(sc.transform(X_tr), Y_tr)
         n_nz = int((mtl.coef_ != 0).any(axis=0).sum())
         print(f"  [multitask_lasso] alpha={mtl.alpha_:.4f}  shared_features={n_nz}")
@@ -453,7 +454,6 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
                                        solver="liblinear", max_iter=2000,
                                        random_state=seed)),
         ])
-        from sklearn.pipeline import Pipeline
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
         models[CAT_RX] = m_cat
 
@@ -477,18 +477,23 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
         models[CAT_RX] = m_cat
 
-    # ── Gaussian Process (RBF kernel) ─────────────────────────────────────────
+    # ── Gaussian Process (PCA + RBF kernel) ──────────────────────────────────
+    # GP on raw 100+ features causes numerical failures; PCA to ≤15 dims first.
     elif model_type == "gp":
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler as _SS
+        from sklearn.decomposition import PCA
         from sklearn.gaussian_process import GaussianProcessRegressor, GaussianProcessClassifier
         from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+        n_comp_gp = min(15, X_tr.shape[0] - 1, X_tr.shape[1])
+        print(f"  [gp] using PCA({n_comp_gp}) before kernel to avoid numerical issues")
         reg_kernel = 1.0 * RBF(length_scale=1.0) + WhiteKernel(noise_level=1.0)
         for col in CONT_RX:
             m = Pipeline([
                 ("sc", _SS()),
+                ("pca", PCA(n_components=n_comp_gp)),
                 ("gp", GaussianProcessRegressor(kernel=reg_kernel,
-                                                n_restarts_optimizer=1,
+                                                n_restarts_optimizer=2,
                                                 normalize_y=True,
                                                 random_state=seed)),
             ])
@@ -497,8 +502,9 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
             models[col] = m
         m_cat = Pipeline([
             ("sc", _SS()),
+            ("pca", PCA(n_components=n_comp_gp)),
             ("gp", GaussianProcessClassifier(kernel=1.0 * RBF(),
-                                             n_restarts_optimizer=1,
+                                             n_restarts_optimizer=2,
                                              random_state=seed)),
         ])
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
