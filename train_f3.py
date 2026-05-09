@@ -380,7 +380,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--stageA",
-        choices=["catboost", "xgboost", "lgbm", "rf", "linear"],
+        choices=["catboost", "xgboost", "lgbm", "rf", "linear", "mlp_nn", "transformer_nn"],
         default="rf",
         help=(
             "Stage A model type for flat mode (default: rf). "
