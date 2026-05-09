@@ -380,13 +380,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--stageA",
-        choices=["catboost", "xgboost", "rf", "linear"],
-        default="catboost",
+        choices=["catboost", "xgboost", "lgbm", "rf", "linear"],
+        default="rf",
         help=(
-            "Stage A model type for flat mode (default: catboost). "
-            "'rf' (Random Forest) has no early stopping — most stable when signal is weak. "
-            "'xgboost' is often slightly stronger than catboost on tabular data. "
-            "'linear' is the most interpretable baseline."
+            "Stage A model type for flat mode (default: rf). "
+            "'rf': Random Forest — no early stopping, stable with weak signal. "
+            "'lgbm': LightGBM — fixed budget + L2 reg, often beats RF. "
+            "'xgboost': XGBoost — binary classification fix included. "
+            "'catboost': CatBoost (original F2 default). "
+            "'linear': Ridge/Logistic regression (interpretable baseline)."
         ),
     )
     parser.add_argument(

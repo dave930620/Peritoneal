@@ -262,11 +262,21 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
             m.fit(X_tr, df_tr[col].values,
                   eval_set=[(X_va, df_va[col].values)], verbose=False)
             models[col] = m
-        m_cat = XGBClassifier(
-            n_estimators=500, learning_rate=0.05, max_depth=6,
-            subsample=0.8, colsample_bytree=0.8, random_state=SEED,
-            early_stopping_rounds=50, eval_metric="mlogloss", verbosity=0,
-        )
+        # Binary vs multiclass — XGBoost requires different objective/metric
+        n_cat_cls = int(df_tr[CAT_RX].max()) + 1
+        if n_cat_cls == 2:
+            m_cat = XGBClassifier(
+                n_estimators=500, learning_rate=0.05, max_depth=6,
+                subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+                objective="binary:logistic",
+                early_stopping_rounds=50, eval_metric="logloss", verbosity=0,
+            )
+        else:
+            m_cat = XGBClassifier(
+                n_estimators=500, learning_rate=0.05, max_depth=6,
+                subsample=0.8, colsample_bytree=0.8, random_state=SEED,
+                early_stopping_rounds=50, eval_metric="mlogloss", verbosity=0,
+            )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values,
                   eval_set=[(X_va, df_va[CAT_RX].astype(int).values)], verbose=False)
         models[CAT_RX] = m_cat
@@ -287,6 +297,41 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         )
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
         models[CAT_RX] = m_cat
+
+    # ── LightGBM ──────────────────────────────────────────────────────────────
+    elif model_type == "lgbm":
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            raise ImportError("pip install lightgbm")
+        # CONT_RX regressors: fixed budget + L2 regularisation, NO early stopping.
+        # Avoids the best_iter=0 degeneration seen with CatBoost/XGBoost when
+        # clinical-feature signal is weak.
+        for col in CONT_RX:
+            m = lgb.LGBMRegressor(
+                n_estimators=800, learning_rate=0.02,
+                num_leaves=63, min_child_samples=20,
+                reg_lambda=5.0, subsample=0.8, colsample_bytree=0.8,
+                random_state=SEED, verbose=-1, n_jobs=-1,
+            )
+            m.fit(X_tr, df_tr[col].values)   # no eval_set → full 800 rounds
+            models[col] = m
+        # CAT_RX classifier: use early stopping (stronger signal than CONT_RX)
+        n_cat_cls = int(df_tr[CAT_RX].max()) + 1
+        m_cat = lgb.LGBMClassifier(
+            n_estimators=1000, learning_rate=0.02,
+            num_leaves=63, min_child_samples=20,
+            reg_lambda=3.0, subsample=0.8, colsample_bytree=0.8,
+            random_state=SEED, verbose=-1, n_jobs=-1,
+        )
+        m_cat.fit(
+            X_tr, df_tr[CAT_RX].astype(int).values,
+            eval_set=[(X_va, df_va[CAT_RX].astype(int).values)],
+            callbacks=[lgb.early_stopping(50, verbose=False),
+                       lgb.log_evaluation(-1)],
+        )
+        models[CAT_RX] = m_cat
+        print(f"  [lgbm] {CAT_RX}: best_iter={m_cat.best_iteration_}")
 
     # ── Linear (Ridge + Logistic) ─────────────────────────────────────────────
     elif model_type == "linear":
@@ -336,7 +381,7 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
     else:
         raise ValueError(
             f"Unknown model_type '{model_type}'. "
-            f"Choose: catboost, xgboost, rf, linear, mlp_nn, transformer_nn")
+            f"Choose: catboost, xgboost, lgbm, rf, linear, mlp_nn, transformer_nn")
 
     return models
 
