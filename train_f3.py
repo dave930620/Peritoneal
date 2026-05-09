@@ -58,8 +58,8 @@ import torch.nn as nn
 
 from src.config import (
     CAT_RX, CLINICAL_THRESHOLD, CONT_RX, DATA_CSV, DELTA_WIN,
-    F1_MODEL_PATH, F2_BATCH_SIZE, F2_DROPOUT, F2_HIDDEN, FEATURE_INFO_PATH,
-    OUTCOME_COL, PATIENT_ID_COL, SEED, STEP_MAP,
+    DISCRETE_COLUMNS, F1_MODEL_PATH, F2_BATCH_SIZE, F2_DROPOUT, F2_HIDDEN,
+    FEATURE_INFO_PATH, OUTCOME_COL, PATIENT_ID_COL, SEED, STEP_MAP,
 )
 from src.data.preprocessor import (
     RxDataset, load_feature_info, patient_split, remove_outlier_patients,
@@ -235,6 +235,28 @@ def evaluate_and_save(
 
 
 # =============================================================================
+# Patient-level aggregation
+# =============================================================================
+
+def _aggregate_patients(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse visit-level rows to one row per patient.
+
+    Numeric columns → mean across visits.
+    Discrete/categorical columns → mode (most common value) across visits.
+    Returns one row per PatientID, indexed 0..N-1.
+    """
+    discrete_in_df = [c for c in DISCRETE_COLUMNS if c in df.columns]
+    numeric_cols   = [c for c in df.columns
+                      if c not in discrete_in_df and c != PATIENT_ID_COL]
+
+    agg: dict = {c: "mean" for c in numeric_cols}
+    for c in discrete_in_df:
+        agg[c] = lambda x: x.mode().iloc[0]
+
+    return df.groupby(PATIENT_ID_COL, as_index=False).agg(agg).reset_index(drop=True)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -276,6 +298,16 @@ def _prepare_data(args: argparse.Namespace):
     tr, va, te = patient_split(df_use, PATIENT_ID_COL,
                                train_frac=0.75, val_frac=0.15, test_frac=0.10)
     patient_cols = get_patient_feature_cols(feature_info)
+
+    # Patient-level aggregation: collapse all visits per patient into one row
+    # (mean of numeric columns, mode of discrete columns).
+    # Prevents models from memorising "patient X → prescription Y" across
+    # their repeated visits, forcing generalisation to unseen patients.
+    if not args.no_patient_level:
+        tr = _aggregate_patients(tr)
+        va = _aggregate_patients(va)
+        te = _aggregate_patients(te)
+        print(f"[F3] Patient-level: train={len(tr)} val={len(va)} test={len(te)} rows")
 
     return dict(
         tr=tr, va=va, te=te, df_use=df_use,
@@ -509,6 +541,11 @@ if __name__ == "__main__":
             "(default: 1). Only applies to the comparison mode (no --stageA). "
             "Use 5+ to measure variance across seeds."
         ),
+    )
+    parser.add_argument(
+        "--no_patient_level", action="store_true",
+        help="Disable patient-level aggregation (default: on). "
+             "When off, models train on visit-level rows and overfit badly.",
     )
     parser.add_argument(
         "--oracle", action="store_true",
