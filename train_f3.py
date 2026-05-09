@@ -133,17 +133,27 @@ def get_patient_feature_cols(feature_info: dict) -> list:
     return [c for c in feature_info["original_feature_names"] if c not in rx_cols]
 
 
-def print_stage_a_similarity(df_val, teacher_va: dict, label: str = "Stage A") -> None:
-    """Print Pearson / RMSE between Stage A predictions and doctor ground truth."""
+STAGE_A_TYPES = ["rf", "catboost", "xgboost", "lgbm", "linear", "mlp_nn", "transformer_nn"]
+
+
+def print_stage_a_similarity(df_val, teacher_va: dict, label: str = "Stage A") -> dict:
+    """Print Pearson / RMSE between Stage A predictions and doctor ground truth.
+
+    Returns a dict: {col: pearson, ..., CAT_RX: accuracy}
+    """
     print(f"\n[A] {label} val-set similarity:")
+    result = {}
     for j, col in enumerate(CONT_RX):
         gt   = df_val[col].values.astype(float)
         pred = teacher_va["cont"][:, j].astype(float)
         r    = pearson_correlation(gt, pred)
         rmse = float(np.sqrt(np.mean((gt - pred) ** 2)))
         print(f"  {col}: Pearson={r:.4f}  RMSE={rmse:.4f}")
+        result[col] = r
     acc = float((df_val[CAT_RX].astype(int).values == teacher_va["cat"]).mean())
     print(f"  {CAT_RX}: Accuracy={acc:.4f}")
+    result[CAT_RX] = acc
+    return result
 
 
 def oracle_similarity(df_val, stage_a: HierarchicalStageA,
@@ -228,7 +238,8 @@ def evaluate_and_save(
 # Main
 # =============================================================================
 
-def main(args: argparse.Namespace) -> None:
+def _prepare_data(args: argparse.Namespace):
+    """Load data, F1 oracle, and split — shared across all Stage A runs."""
     set_seed(SEED)
     Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -237,9 +248,6 @@ def main(args: argparse.Namespace) -> None:
     use_amp   = is_amp_supported(device)
     dl_kwargs = get_dataloader_kwargs(device)
 
-    # ------------------------------------------------------------------
-    # 1. Data + feature_info
-    # ------------------------------------------------------------------
     print(f"[F3] Loading data: {DATA_CSV}")
     df_raw = pd.read_csv(DATA_CSV)
     print(f"[F3] Shape: {df_raw.shape}  mode={args.mode}")
@@ -250,18 +258,12 @@ def main(args: argparse.Namespace) -> None:
     validate_columns(df_raw, orig_features + [OUTCOME_COL, PATIENT_ID_COL], "train_f3")
     sanity_check_data(df_raw)
 
-    # ------------------------------------------------------------------
-    # 2. Frozen F1 oracle
-    # ------------------------------------------------------------------
     print(f"[F3] Loading F1 model: {F1_MODEL_PATH}")
     f1_model = load_f1_model(F1_MODEL_PATH, feature_info, device)
 
     def f1_fn(df_part: pd.DataFrame) -> np.ndarray:
         return f1_predict_raw(df_part, feature_info, f1_model, device)
 
-    # ------------------------------------------------------------------
-    # 3. Patient-wise split (outliers removed before split)
-    # ------------------------------------------------------------------
     cols_needed = [PATIENT_ID_COL, OUTCOME_COL] + orig_features
     df_use = df_raw[cols_needed].copy()
     df_use = df_use.loc[:, ~df_use.columns.duplicated()]
@@ -270,8 +272,77 @@ def main(args: argparse.Namespace) -> None:
     df_use = remove_outlier_patients(df_use)
 
     tr, va, te = patient_split(df_use, PATIENT_ID_COL, TRAIN_FRAC, VAL_FRAC, TEST_FRAC)
-
     patient_cols = get_patient_feature_cols(feature_info)
+
+    return dict(
+        tr=tr, va=va, te=te, df_use=df_use,
+        feature_info=feature_info, orig_features=orig_features,
+        patient_cols=patient_cols, f1_model=f1_model, f1_fn=f1_fn,
+        device=device, use_amp=use_amp, dl_kwargs=dl_kwargs,
+    )
+
+
+def compare_all_stage_a(args: argparse.Namespace) -> None:
+    """Run Stage A for every model type and print a comparison table.
+
+    Stage B is NOT run — this is a fast Stage A benchmark only.
+    Use `python train_f3.py --stageA <model>` to run the full pipeline.
+    """
+    ctx = _prepare_data(args)
+    tr, va, feature_info = ctx["tr"], ctx["va"], ctx["feature_info"]
+
+    summary: dict = {}   # model_type → {col: pearson, CAT_RX: acc}
+
+    for model_type in STAGE_A_TYPES:
+        print(f"\n{'='*60}")
+        print(f"[F3] Stage A — {model_type.upper()}")
+        try:
+            sa_models  = train_stage_A(tr, va, feature_info, model_type=model_type)
+            teacher_va = get_stage_A_preds(va, sa_models, feature_info)
+            result     = print_stage_a_similarity(va, teacher_va,
+                                                  label=f"Stage A ({model_type})")
+            summary[model_type] = result
+        except Exception as exc:
+            print(f"  [ERROR] {model_type} failed: {exc}")
+            summary[model_type] = None
+
+    # ------------------------------------------------------------------
+    # Comparison table
+    # ------------------------------------------------------------------
+    short = {col: col[:9] for col in CONT_RX}
+    header = f"{'Model':15s}" + "".join(f"  {short[c]:>9s}" for c in CONT_RX) + f"  {'PD_acc':>6s}  {'Mean_r':>6s}"
+    print(f"\n{'='*len(header)}")
+    print("STAGE A COMPARISON — val-set Pearson (higher is better)")
+    print(header)
+    print("-" * len(header))
+    for model_type, res in summary.items():
+        if res is None:
+            print(f"{model_type:15s}  ERROR")
+            continue
+        mean_r = float(np.mean([res.get(c, float("nan")) for c in CONT_RX]))
+        row = f"{model_type:15s}"
+        for col in CONT_RX:
+            row += f"  {res.get(col, float('nan')):9.4f}"
+        row += f"  {res.get(CAT_RX, float('nan')):6.4f}  {mean_r:6.4f}"
+        print(row)
+    print(f"{'='*len(header)}")
+    print("\nRun `python train_f3.py --stageA <best_model>` for the full Stage A + B pipeline.")
+
+
+def main(args: argparse.Namespace) -> None:
+    ctx = _prepare_data(args)
+    tr           = ctx["tr"]
+    va           = ctx["va"]
+    te           = ctx["te"]
+    df_use       = ctx["df_use"]
+    feature_info = ctx["feature_info"]
+    orig_features= ctx["orig_features"]
+    patient_cols = ctx["patient_cols"]
+    f1_model     = ctx["f1_model"]
+    f1_fn        = ctx["f1_fn"]
+    device       = ctx["device"]
+    use_amp      = ctx["use_amp"]
+    dl_kwargs    = ctx["dl_kwargs"]
 
     # ------------------------------------------------------------------
     # 4. Stage A
@@ -385,14 +456,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stageA",
         choices=["catboost", "xgboost", "lgbm", "rf", "linear", "mlp_nn", "transformer_nn"],
-        default="rf",
+        default=None,
         help=(
-            "Stage A model type for flat mode (default: rf). "
-            "'rf': Random Forest — no early stopping, stable with weak signal. "
-            "'lgbm': LightGBM — fixed budget + L2 reg, often beats RF. "
-            "'xgboost': XGBoost — binary classification fix included. "
-            "'catboost': CatBoost (original F2 default). "
-            "'linear': Ridge/Logistic regression (interpretable baseline)."
+            "Stage A model type for flat mode. "
+            "Omit to benchmark ALL models (Stage A only, no Stage B). "
+            "Specify one to run the full Stage A + B pipeline. "
+            "Options: rf, catboost, xgboost, lgbm, linear, mlp_nn, transformer_nn."
         ),
     )
     parser.add_argument(
@@ -400,4 +469,8 @@ if __name__ == "__main__":
         help="(stratified/chain only) Evaluate with true class labels — "
              "shows upper bound of hierarchical Stage A.",
     )
-    main(parser.parse_args())
+    args = parser.parse_args()
+    if args.stageA is None:
+        compare_all_stage_a(args)
+    else:
+        main(args)
