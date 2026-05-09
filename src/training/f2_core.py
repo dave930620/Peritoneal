@@ -339,19 +339,22 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
         models[CAT_RX] = m_cat
         print(f"  [lgbm] {CAT_RX}: best_iter={m_cat.best_iteration_}")
 
-    # ── Linear (Ridge + Logistic) ─────────────────────────────────────────────
+    # ── Linear (RidgeCV + Logistic) ───────────────────────────────────────────
     elif model_type == "linear":
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler as _SS
-        from sklearn.linear_model import Ridge, LogisticRegression
+        from sklearn.linear_model import RidgeCV, LogisticRegressionCV
+        _alphas = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
         for col in CONT_RX:
-            m = Pipeline([("sc", _SS()), ("m", Ridge(alpha=1.0))])
+            m = Pipeline([("sc", _SS()), ("m", RidgeCV(alphas=_alphas))])
             m.fit(X_tr, df_tr[col].values)
+            best_a = m.named_steps["m"].alpha_
+            print(f"  [linear] {col}: best_alpha={best_a}")
             models[col] = m
         m_cat = Pipeline([
             ("sc", _SS()),
-            ("m", LogisticRegression(max_iter=1000, C=1.0,
-                                     multi_class="multinomial", random_state=seed)),
+            ("m", LogisticRegressionCV(Cs=[0.001, 0.01, 0.1, 1.0, 10.0],
+                                       max_iter=2000, random_state=seed)),
         ])
         m_cat.fit(X_tr, df_tr[CAT_RX].astype(int).values)
         models[CAT_RX] = m_cat
