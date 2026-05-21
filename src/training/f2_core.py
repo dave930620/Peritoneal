@@ -210,15 +210,19 @@ def _train_stage_A_nn(df_tr, df_va, feature_info: dict,
 def train_stage_A(df_tr, df_va, feature_info: dict,
                   model_type: str = "catboost", save_dir: str = "",
                   lag_cols: Optional[list] = None,
-                  seed: int = SEED) -> dict:
+                  seed: int = SEED,
+                  patient_cols: Optional[list] = None) -> dict:
     """Train Stage A doctor-mimic model.
 
-    model_type : "catboost" | "xgboost" | "rf" | "linear"
-    lag_cols   : extra column names from build_lag_features() to include in input.
+    model_type   : "catboost" | "xgboost" | "rf" | "linear" | ...
+    lag_cols     : extra column names from build_lag_features() to include.
+    patient_cols : override the default full feature set (e.g. after --top_k
+                   feature selection). If None, uses all patient feature cols.
     Returns a dict mapping each CONT_RX column and CAT_RX to a fitted model.
     All returned models expose .predict(X) with the same interface.
     """
-    patient_cols = _patient_feature_cols(feature_info)
+    if patient_cols is None:
+        patient_cols = _patient_feature_cols(feature_info)
     input_cols   = patient_cols + (lag_cols or [])
     X_tr = df_tr[input_cols].values
     X_va = df_va[input_cols].values
@@ -605,8 +609,13 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
 
 
 def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict,
-                      lag_cols: Optional[list] = None) -> dict:
-    """Get Stage A predictions. Works for ML models and DL (nn) models."""
+                      lag_cols: Optional[list] = None,
+                      patient_cols: Optional[list] = None) -> dict:
+    """Get Stage A predictions. Works for ML models and DL (nn) models.
+
+    patient_cols : override the default full feature set (must match what was
+                   used in train_stage_A, e.g. after --top_k selection).
+    """
 
     # ── DL path ───────────────────────────────────────────────────────────────
     if stage_a_models.get("_type") == "nn":
@@ -636,7 +645,8 @@ def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict,
         return {"cont": cont.astype(np.float32), "cat": cat}
 
     # ── ML path ───────────────────────────────────────────────────────────────
-    patient_cols = _patient_feature_cols(feature_info)
+    if patient_cols is None:
+        patient_cols = _patient_feature_cols(feature_info)
     input_cols   = patient_cols + (lag_cols or [])
     X = df[input_cols].values   # numpy array — works for all sklearn/xgb models
     cont = np.zeros((len(df), len(CONT_RX)), dtype=np.float32)

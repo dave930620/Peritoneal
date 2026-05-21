@@ -363,6 +363,7 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
     """
     ctx = _prepare_data(args)
     tr, va, feature_info = ctx["tr"], ctx["va"], ctx["feature_info"]
+    patient_cols = ctx["patient_cols"]
 
     n_runs = args.n_runs
     # all_results[model_type] = list of per-run result dicts
@@ -376,9 +377,12 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
             print(f"  --- run {run_i+1}/{n_runs}  seed={seed} ---")
             try:
                 sa_models  = train_stage_A(tr, va, feature_info,
-                                           model_type=model_type, seed=seed)
-                teacher_va = get_stage_A_preds(va, sa_models, feature_info)
-                teacher_tr = get_stage_A_preds(tr, sa_models, feature_info)
+                                           model_type=model_type, seed=seed,
+                                           patient_cols=patient_cols)
+                teacher_va = get_stage_A_preds(va, sa_models, feature_info,
+                                               patient_cols=patient_cols)
+                teacher_tr = get_stage_A_preds(tr, sa_models, feature_info,
+                                               patient_cols=patient_cols)
                 result     = print_stage_a_similarity(
                     va, teacher_va, label=f"Stage A ({model_type}, seed={seed})")
                 tr_result  = print_stage_a_similarity(
@@ -459,10 +463,14 @@ def main(args: argparse.Namespace) -> None:
 
     if args.mode == "flat":
         print(f"\n[F3] Stage A — flat {args.stageA.upper()} (no lag features)")
-        sa_models  = train_stage_A(tr, va, feature_info, model_type=args.stageA)
-        teacher_tr = get_stage_A_preds(tr, sa_models, feature_info)
-        teacher_va = get_stage_A_preds(va, sa_models, feature_info)
-        teacher_te = get_stage_A_preds(te, sa_models, feature_info)
+        sa_models  = train_stage_A(tr, va, feature_info, model_type=args.stageA,
+                                   patient_cols=patient_cols)
+        teacher_tr = get_stage_A_preds(tr, sa_models, feature_info,
+                                       patient_cols=patient_cols)
+        teacher_va = get_stage_A_preds(va, sa_models, feature_info,
+                                       patient_cols=patient_cols)
+        teacher_te = get_stage_A_preds(te, sa_models, feature_info,
+                                       patient_cols=patient_cols)
 
     else:
         # Hierarchical Stage A (stratified or chain).
