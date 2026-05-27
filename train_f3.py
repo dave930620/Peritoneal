@@ -69,7 +69,7 @@ from src.models.f2_head import F2RxHead
 from src.models.stage_a_hierarchical import HierarchicalStageA
 from src.training.f2_core import (
     get_stage_A_preds, infer_prescriptions, make_cfg,
-    train_stage_A, train_stage_B,
+    refit_night_models_on_apd, train_stage_A, train_stage_B,
 )
 from src.utils.device import (
     get_dataloader_kwargs, get_device, is_amp_supported, print_device_info,
@@ -139,20 +139,38 @@ STAGE_A_TYPES = [
     "elasticnet", "svr",
 ]
 
+# Nighttime prescription variables — only meaningful for APD patients.
+# CAPD patients have no overnight machine, so these are always 0 for them.
+NIGHT_RX = ["night time PD", "Fluid change times", "glucose_total_n", "calcium_total_n"]
+
 
 def print_stage_a_similarity(df_val, teacher_va: dict, label: str = "Stage A") -> dict:
     """Print Pearson / RMSE between Stage A predictions and doctor ground truth.
 
+    For nighttime prescription variables (NIGHT_RX), Pearson is computed only on
+    APD patients (those with night time PD > 0), because CAPD patients always have
+    zero nighttime prescriptions — including them inflates the denominator and
+    makes the metric misleading.
+
     Returns a dict: {col: pearson, ..., CAT_RX: accuracy}
     """
     print(f"\n[A] {label} val-set similarity:")
-    result = {}
+    # APD mask: patients who truly use a nighttime machine
+    apd_mask = df_val["night time PD"].values > 0
+    n_apd    = int(apd_mask.sum())
+    result   = {}
     for j, col in enumerate(CONT_RX):
         gt   = df_val[col].values.astype(float)
         pred = teacher_va["cont"][:, j].astype(float)
-        r    = pearson_correlation(gt, pred)
-        rmse = float(np.sqrt(np.mean((gt - pred) ** 2)))
-        print(f"  {col}: Pearson={r:.4f}  RMSE={rmse:.4f}")
+        if col in NIGHT_RX and n_apd >= 5:
+            gt_r, pred_r = gt[apd_mask], pred[apd_mask]
+            suffix = f"  [APD-only n={n_apd}]"
+        else:
+            gt_r, pred_r = gt, pred
+            suffix = ""
+        r    = pearson_correlation(gt_r, pred_r)
+        rmse = float(np.sqrt(np.mean((gt_r - pred_r) ** 2)))
+        print(f"  {col}: Pearson={r:.4f}  RMSE={rmse:.4f}{suffix}")
         result[col] = r
     acc = float((df_val[CAT_RX].astype(int).values == teacher_va["cat"]).mean())
     print(f"  {CAT_RX}: Accuracy={acc:.4f}")
@@ -260,6 +278,44 @@ def _aggregate_patients(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby(PATIENT_ID_COL, as_index=False).agg(agg).reset_index(drop=True)
 
 
+def _augment_patients(df_raw: pd.DataFrame, n_augment: int = 4,
+                      sample_frac: float = 0.7, seed: int = SEED) -> pd.DataFrame:
+    """Create synthetic training patients by subsampling each patient's visits.
+
+    For each real patient, randomly sample `sample_frac` of their visits
+    `n_augment` times, aggregating each subsample → one virtual patient row.
+    Patients with fewer than 3 visits are skipped (not enough variation).
+
+    Only call on the training split — never on val/test.
+    """
+    rng  = np.random.RandomState(seed)
+    discrete_in_df = [c for c in DISCRETE_COLUMNS if c in df_raw.columns]
+    rows = []
+
+    for pid, grp in df_raw.groupby(PATIENT_ID_COL):
+        n = len(grp)
+        if n < 3:
+            continue
+        k = max(1, int(n * sample_frac))
+        for aug_i in range(n_augment):
+            sampled = grp.sample(n=k, replace=False,
+                                 random_state=int(rng.randint(0, 2**31)))
+            row = {PATIENT_ID_COL: f"aug_{pid}_{aug_i}"}
+            for col in df_raw.columns:
+                if col == PATIENT_ID_COL:
+                    continue
+                elif col in discrete_in_df:
+                    vals = sampled[col].dropna()
+                    row[col] = vals.mode().iloc[0] if len(vals) > 0 else np.nan
+                else:
+                    row[col] = sampled[col].mean()
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=df_raw.columns)
+    return pd.DataFrame(rows)
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -339,6 +395,12 @@ def _prepare_data(args: argparse.Namespace):
     # Prevents models from memorising "patient X → prescription Y" across
     # their repeated visits, forcing generalisation to unseen patients.
     if not args.no_patient_level:
+        n_aug = getattr(args, "augment", 0)
+        if n_aug > 0:
+            tr_aug = _augment_patients(tr, n_augment=n_aug, seed=SEED)
+            tr     = pd.concat([tr, tr_aug], ignore_index=True)
+            print(f"[F3] Augmented training: +{len(tr_aug)} virtual visit-rows "
+                  f"({n_aug} subsamplings × {tr[PATIENT_ID_COL].nunique() - len(tr_aug)//n_aug} patients)")
         tr = _aggregate_patients(tr)
         va = _aggregate_patients(va)
         te = _aggregate_patients(te)
@@ -379,6 +441,8 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
                 sa_models  = train_stage_A(tr, va, feature_info,
                                            model_type=model_type, seed=seed,
                                            patient_cols=patient_cols)
+                if getattr(args, "night_filter", False):
+                    refit_night_models_on_apd(sa_models, tr, patient_cols)
                 teacher_va = get_stage_A_preds(va, sa_models, feature_info,
                                                patient_cols=patient_cols)
                 teacher_tr = get_stage_A_preds(tr, sa_models, feature_info,
@@ -465,6 +529,8 @@ def main(args: argparse.Namespace) -> None:
         print(f"\n[F3] Stage A — flat {args.stageA.upper()} (no lag features)")
         sa_models  = train_stage_A(tr, va, feature_info, model_type=args.stageA,
                                    patient_cols=patient_cols)
+        if getattr(args, "night_filter", False):
+            refit_night_models_on_apd(sa_models, tr, patient_cols)
         teacher_tr = get_stage_A_preds(tr, sa_models, feature_info,
                                        patient_cols=patient_cols)
         teacher_va = get_stage_A_preds(va, sa_models, feature_info,
@@ -598,6 +664,19 @@ if __name__ == "__main__":
         "--top_k", type=int, default=None, metavar="K",
         help="Select top K features via MultiTaskLasso importance before training "
              "(e.g. --top_k 25). Default: use all features.",
+    )
+    parser.add_argument(
+        "--augment", type=int, default=0, metavar="N",
+        help="Number of synthetic patients to create per real patient via visit "
+             "subsampling (e.g. --augment 4). Each subsample draws 70%% of a "
+             "patient's visits and aggregates them into one virtual patient row. "
+             "Applied to training only. Default: 0 (off).",
+    )
+    parser.add_argument(
+        "--night_filter", action="store_true",
+        help="Re-fit nighttime prescription models using only APD patients after "
+             "initial training (Suggestion 3). Nighttime Pearson is always "
+             "evaluated on APD-only patients regardless of this flag.",
     )
     parser.add_argument(
         "--oracle", action="store_true",

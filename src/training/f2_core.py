@@ -608,6 +608,56 @@ def train_stage_A(df_tr, df_va, feature_info: dict,
     return models
 
 
+# Nighttime prescription variables — only meaningful for APD patients.
+_NIGHT_RX = {"night time PD", "Fluid change times", "glucose_total_n", "calcium_total_n"}
+
+
+def refit_night_models_on_apd(models: dict, df_tr, input_cols: list,
+                               min_apd: int = 10) -> None:
+    """Re-fit nighttime-variable models using only APD training patients.
+
+    Called after train_stage_A when night_filter=True.  Patients on CAPD always
+    have zero nighttime prescriptions, so including them during training pushes
+    the regression toward zero and dilutes the APD-specific signal.
+
+    Modifies `models` in-place.  Skips model types that cannot be re-fitted
+    with a plain .fit(X, y) call (multitask_lasso, cluster, nn).
+    """
+    apd_mask = df_tr["night time PD"].values > 0
+    n_apd    = int(apd_mask.sum())
+    if n_apd < min_apd:
+        print(f"  [night_filter] only {n_apd} APD train patients — skipping re-fit.")
+        return
+
+    print(f"  [night_filter] Re-fitting night vars on {n_apd} APD patients ...")
+    X_apd = df_tr.loc[apd_mask, input_cols]
+
+    for col in _NIGHT_RX:
+        if col not in models:
+            continue
+        m   = models[col]
+        y   = df_tr.loc[apd_mask, col].values
+
+        # Skip wrapper types that don't support plain .fit()
+        if not hasattr(m, "fit"):
+            print(f"    {col}: skipped (no .fit method)")
+            continue
+        # Skip _MTLCol (MultiTaskLasso column wrapper)
+        if type(m).__name__ == "_MTLCol":
+            print(f"    {col}: skipped (MultiTaskLasso joint model)")
+            continue
+        # Skip _ClusterMean
+        if type(m).__name__ == "_ClusterMean":
+            print(f"    {col}: skipped (cluster model)")
+            continue
+
+        try:
+            m.fit(X_apd, y)
+            print(f"    {col}: re-fitted on APD subset (n={n_apd})")
+        except Exception as exc:
+            print(f"    {col}: re-fit failed ({exc})")
+
+
 def get_stage_A_preds(df, stage_a_models: dict, feature_info: dict,
                       lag_cols: Optional[list] = None,
                       patient_cols: Optional[list] = None) -> dict:

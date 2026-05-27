@@ -29,3 +29,7 @@ shap>=0.44.0
 
 # Statistics (new)
 scipy>=1.11.0            # Wilcoxon test, bootstrap CI
+
+
+
+loss curve, overfit, oversample, sugmatation.
