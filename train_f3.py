@@ -317,6 +317,149 @@ def _augment_patients(df_raw: pd.DataFrame, n_augment: int = 4,
 
 
 # =============================================================================
+# Two-stage prediction helper
+# =============================================================================
+
+def _predict_two_stage(df, day_models: dict, day_cols: list,
+                        night_models: dict, night_cols: list,
+                        feature_info: dict) -> dict:
+    """Combine day model (all patients) and night model (APD-only trained).
+
+    day_models  → CAT_RX + 4 daytime vars, trained on ALL patients
+    night_models → 4 nighttime vars, trained on APD patients only
+    Returns {"cont": (N, 8), "cat": (N,)}
+    """
+    day_preds   = get_stage_A_preds(df, day_models,   feature_info,
+                                    patient_cols=day_cols)
+    night_preds = get_stage_A_preds(df, night_models, feature_info,
+                                    patient_cols=night_cols)
+    cont = day_preds["cont"].copy()
+    night_set = set(NIGHT_RX)
+    for j, col in enumerate(CONT_RX):
+        if col in night_set:
+            cont[:, j] = night_preds["cont"][:, j]
+    return {"cont": cont, "cat": day_preds["cat"]}
+
+
+# =============================================================================
+# Top-k sweep
+# =============================================================================
+
+def sweep_top_k(args: argparse.Namespace) -> None:
+    """Train with each k in K_VALUES and plot val Pearson vs k per prescription var.
+
+    Uses --stageA model type (default: lasso).
+    Daytime vars evaluated on all patients; nighttime vars on APD-only.
+    """
+    import copy
+
+    K_VALUES = [5, 10, 15, 20, 25, 30, 40, 50, 75]
+
+    # Load data without feature selection so we have the full feature set
+    base_args        = copy.copy(args)
+    base_args.top_k  = None
+    ctx              = _prepare_data(base_args)
+    tr               = ctx["tr"]
+    va               = ctx["va"]
+    feature_info     = ctx["feature_info"]
+    all_patient_cols = ctx["patient_cols"]
+
+    model_type = args.stageA or "lasso"
+    n_all      = len(all_patient_cols)
+    k_vals     = sorted({k for k in K_VALUES if k < n_all} | {n_all})
+    k_labels   = [str(k) if k < n_all else f"all\n({n_all})" for k in k_vals]
+
+    apd_mask_va = va["night time PD"].values > 0
+    apd_mask_tr = tr["night time PD"].values > 0
+
+    print(f"\n[sweep_top_k] model={model_type}  "
+          f"k_values={[str(k) if k<n_all else 'all' for k in k_vals]}")
+
+    val_r: dict = {col: [] for col in CONT_RX}
+    tr_r:  dict = {col: [] for col in CONT_RX}
+
+    for k in k_vals:
+        label = k if k < n_all else "all"
+        print(f"  k={label} ...", end="  ", flush=True)
+        pcols = _select_features(tr, all_patient_cols, k) if k < n_all else all_patient_cols
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                sa = train_stage_A(tr, va, feature_info, model_type=model_type,
+                                   patient_cols=pcols, seed=SEED)
+            pred_va = get_stage_A_preds(va, sa, feature_info, patient_cols=pcols)
+            pred_tr = get_stage_A_preds(tr, sa, feature_info, patient_cols=pcols)
+
+            for j, col in enumerate(CONT_RX):
+                gv = va[col].values.astype(float)
+                pv = pred_va["cont"][:, j].astype(float)
+                gt = tr[col].values.astype(float)
+                pt = pred_tr["cont"][:, j].astype(float)
+                if col in NIGHT_RX:
+                    gv, pv = gv[apd_mask_va], pv[apd_mask_va]
+                    gt, pt = gt[apd_mask_tr], pt[apd_mask_tr]
+                val_r[col].append(pearson_correlation(gv, pv))
+                tr_r[col].append(pearson_correlation(gt, pt))
+            print("done")
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+            for col in CONT_RX:
+                val_r[col].append(float("nan"))
+                tr_r[col].append(float("nan"))
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    day_cols_plot   = [c for c in CONT_RX if c not in set(NIGHT_RX)]
+    night_cols_plot = [c for c in CONT_RX if c in     set(NIGHT_RX)]
+    x = list(range(len(k_vals)))
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8), sharey=False)
+    fig.suptitle(f"Val Pearson vs top_k features  (model = {model_type})", fontsize=13)
+
+    for row_i, group in enumerate([day_cols_plot, night_cols_plot]):
+        for col_i, col in enumerate(group):
+            ax    = axes[row_i][col_i]
+            note  = "  [APD-only]" if col in set(NIGHT_RX) else ""
+            v_arr = val_r[col]
+            t_arr = tr_r[col]
+
+            ax.plot(x, v_arr, "o-",  color="steelblue", lw=2,   label="val")
+            ax.plot(x, t_arr, "s--", color="coral",     lw=1.5, alpha=0.7, label="train")
+            ax.axhline(0, color="gray", lw=0.8, ls=":")
+
+            # Mark best val k
+            valid = [(i, v) for i, v in enumerate(v_arr) if not np.isnan(v)]
+            if valid:
+                best_i, best_v = max(valid, key=lambda t: t[1])
+                ax.axvline(best_i, color="steelblue", lw=0.8, ls="--", alpha=0.5)
+                ax.annotate(f"k={k_vals[best_i] if k_vals[best_i]<n_all else 'all'}\n{best_v:.3f}",
+                            xy=(best_i, best_v), xytext=(5, -15),
+                            textcoords="offset points", fontsize=7, color="steelblue")
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(k_labels, fontsize=7)
+            ax.set_xlabel("top_k", fontsize=8)
+            ax.set_ylabel("Pearson", fontsize=8)
+            ax.set_title(f"{col[:22]}{note}", fontsize=8)
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+    out = os.path.join(REPORT_DIR, f"top_k_sweep_{model_type}.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"\n[sweep_top_k] Saved → {out}")
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    short = [c[:8] for c in CONT_RX]
+    print("\n" + f"{'k':>6s}  " + "  ".join(f"{s:>9s}" for s in short))
+    for i, k in enumerate(k_vals):
+        lbl = str(k) if k < n_all else "all"
+        row = f"{lbl:>6s}  " + "  ".join(f"{val_r[c][i]:>9.4f}" for c in CONT_RX)
+        print(row)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -409,11 +552,29 @@ def _prepare_data(args: argparse.Namespace):
     if getattr(args, "top_k", None):
         patient_cols = _select_features(tr, patient_cols, args.top_k)
 
+    # Two-stage: separate feature selection on APD patients for night vars
+    night_cols_override = None
+    if getattr(args, "two_stage", False):
+        apd_mask = tr["night time PD"].values > 0
+        tr_apd   = tr[apd_mask]
+        n_apd_tr = int(apd_mask.sum())
+        print(f"\n[F3] Two-stage: {n_apd_tr} APD training patients for night vars")
+        if n_apd_tr >= 10:
+            k = getattr(args, "top_k", None) or len(patient_cols)
+            # Re-run feature selection on APD subset so chosen features are
+            # relevant to nighttime prescription signal, not the full population
+            all_pcols = get_patient_feature_cols(feature_info)
+            night_cols_override = _select_features(tr_apd, all_pcols, k)
+            print(f"  Night feature set ({len(night_cols_override)} features, APD-specific)")
+        else:
+            print("  Too few APD patients — night vars will use same feature set")
+
     return dict(
         tr=tr, va=va, te=te, df_use=df_use,
         feature_info=feature_info, orig_features=orig_features,
         patient_cols=patient_cols, f1_model=f1_model, f1_fn=f1_fn,
         device=device, use_amp=use_amp, dl_kwargs=dl_kwargs,
+        night_cols_override=night_cols_override,
     )
 
 
@@ -424,8 +585,17 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
     Use `python train_f3.py --stageA <model>` to run the full pipeline.
     """
     ctx = _prepare_data(args)
-    tr, va, feature_info = ctx["tr"], ctx["va"], ctx["feature_info"]
-    patient_cols = ctx["patient_cols"]
+    tr, va, feature_info    = ctx["tr"], ctx["va"], ctx["feature_info"]
+    patient_cols            = ctx["patient_cols"]
+    night_cols_override     = ctx["night_cols_override"]
+    use_two_stage           = getattr(args, "two_stage", False) and night_cols_override is not None
+
+    # For two-stage: identify APD subsets once
+    if use_two_stage:
+        apd_mask_tr = tr["night time PD"].values > 0
+        apd_mask_va = va["night time PD"].values > 0
+        tr_apd = tr[apd_mask_tr]
+        va_apd = va[apd_mask_va] if apd_mask_va.sum() >= 3 else va
 
     n_runs = args.n_runs
     # all_results[model_type] = list of per-run result dicts
@@ -433,20 +603,33 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
 
     for model_type in STAGE_A_TYPES:
         print(f"\n{'='*60}")
-        print(f"[F3] Stage A — {model_type.upper()}  ({n_runs} run(s))")
+        print(f"[F3] Stage A — {model_type.upper()}  ({n_runs} run(s))"
+              + ("  [two-stage]" if use_two_stage else ""))
         for run_i in range(n_runs):
             seed = SEED + run_i
             print(f"  --- run {run_i+1}/{n_runs}  seed={seed} ---")
             try:
-                sa_models  = train_stage_A(tr, va, feature_info,
-                                           model_type=model_type, seed=seed,
-                                           patient_cols=patient_cols)
-                if getattr(args, "night_filter", False):
-                    refit_night_models_on_apd(sa_models, tr, patient_cols)
-                teacher_va = get_stage_A_preds(va, sa_models, feature_info,
-                                               patient_cols=patient_cols)
-                teacher_tr = get_stage_A_preds(tr, sa_models, feature_info,
-                                               patient_cols=patient_cols)
+                sa_models = train_stage_A(tr, va, feature_info,
+                                          model_type=model_type, seed=seed,
+                                          patient_cols=patient_cols)
+                if use_two_stage:
+                    # Train a separate night model on APD patients only
+                    night_models = train_stage_A(tr_apd, va_apd, feature_info,
+                                                 model_type=model_type, seed=seed,
+                                                 patient_cols=night_cols_override)
+                    teacher_va = _predict_two_stage(
+                        va, sa_models, patient_cols,
+                        night_models, night_cols_override, feature_info)
+                    teacher_tr = _predict_two_stage(
+                        tr, sa_models, patient_cols,
+                        night_models, night_cols_override, feature_info)
+                else:
+                    if getattr(args, "night_filter", False):
+                        refit_night_models_on_apd(sa_models, tr, patient_cols)
+                    teacher_va = get_stage_A_preds(va, sa_models, feature_info,
+                                                   patient_cols=patient_cols)
+                    teacher_tr = get_stage_A_preds(tr, sa_models, feature_info,
+                                                   patient_cols=patient_cols)
                 result     = print_stage_a_similarity(
                     va, teacher_va, label=f"Stage A ({model_type}, seed={seed})")
                 tr_result  = print_stage_a_similarity(
@@ -675,8 +858,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--night_filter", action="store_true",
         help="Re-fit nighttime prescription models using only APD patients after "
-             "initial training (Suggestion 3). Nighttime Pearson is always "
-             "evaluated on APD-only patients regardless of this flag.",
+             "initial training. Nighttime Pearson is always evaluated on APD-only "
+             "patients regardless of this flag.",
+    )
+    parser.add_argument(
+        "--two_stage", action="store_true",
+        help="Train a dedicated nighttime model on APD patients only with APD-specific "
+             "feature selection. Combines a day model (all patients) with a night model "
+             "(APD patients only). Requires --top_k to be set.",
+    )
+    parser.add_argument(
+        "--sweep_k", action="store_true",
+        help="Sweep top_k values [5,10,15,20,25,30,40,50,75,all] and plot val Pearson "
+             "vs k for each prescription variable. Uses --stageA model (default: lasso). "
+             "Saves figure to report_model3/top_k_sweep_<model>.png",
     )
     parser.add_argument(
         "--oracle", action="store_true",
@@ -684,7 +879,9 @@ if __name__ == "__main__":
              "shows upper bound of hierarchical Stage A.",
     )
     args = parser.parse_args()
-    if args.stageA is None:
+    if args.sweep_k:
+        sweep_top_k(args)
+    elif args.stageA is None:
         compare_all_stage_a(args)
     else:
         main(args)
