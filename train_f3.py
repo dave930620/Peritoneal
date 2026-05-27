@@ -175,6 +175,12 @@ def print_stage_a_similarity(df_val, teacher_va: dict, label: str = "Stage A") -
     acc = float((df_val[CAT_RX].astype(int).values == teacher_va["cat"]).mean())
     print(f"  {CAT_RX}: Accuracy={acc:.4f}")
     result[CAT_RX] = acc
+    # Convenience summaries stored in result dict
+    night_set  = set(NIGHT_RX)
+    day_rs     = [result[c] for c in CONT_RX if c not in night_set and not np.isnan(result.get(c, float("nan")))]
+    night_rs   = [result[c] for c in CONT_RX if c in     night_set and not np.isnan(result.get(c, float("nan")))]
+    result["_day_mean"]   = float(np.mean(day_rs))   if day_rs   else float("nan")
+    result["_night_mean"] = float(np.mean(night_rs)) if night_rs else float("nan")
     return result
 
 
@@ -538,12 +544,25 @@ def _prepare_data(args: argparse.Namespace):
     # Prevents models from memorising "patient X → prescription Y" across
     # their repeated visits, forcing generalisation to unseen patients.
     if not args.no_patient_level:
+        max_v = getattr(args, "max_visits", None)
+        if max_v and max_v > 0:
+            rng = np.random.RandomState(SEED)
+            def _subsample(df, k):
+                parts = []
+                for _, grp in df.groupby(PATIENT_ID_COL):
+                    parts.append(grp.sample(n=min(k, len(grp)),
+                                            random_state=int(rng.randint(0, 2**31))))
+                return pd.concat(parts, ignore_index=True)
+            tr_sub = _subsample(tr, max_v)
+            n_before = tr[PATIENT_ID_COL].nunique()
+            print(f"[F3] max_visits={max_v}: {len(tr_sub)} train rows "
+                  f"({n_before} patients, avg {len(tr_sub)/n_before:.1f} visits/patient)")
+            tr = tr_sub
         n_aug = getattr(args, "augment", 0)
         if n_aug > 0:
             tr_aug = _augment_patients(tr, n_augment=n_aug, seed=SEED)
             tr     = pd.concat([tr, tr_aug], ignore_index=True)
-            print(f"[F3] Augmented training: +{len(tr_aug)} virtual visit-rows "
-                  f"({n_aug} subsamplings × {tr[PATIENT_ID_COL].nunique() - len(tr_aug)//n_aug} patients)")
+            print(f"[F3] Augmented training: +{len(tr_aug)} virtual visit-rows")
         tr = _aggregate_patients(tr)
         va = _aggregate_patients(va)
         te = _aggregate_patients(te)
@@ -641,50 +660,70 @@ def compare_all_stage_a(args: argparse.Namespace) -> None:
 
     # ------------------------------------------------------------------
     # Comparison table — mean ± std across runs
+    # Daytime vars (all patients) and nighttime vars (APD-only) shown separately.
     # ------------------------------------------------------------------
-    short  = [col[:8] for col in CONT_RX]
-    col_w  = 14   # width per Pearson column  "0.3122±0.0234"
-    header = f"{'Model':15s}" + "".join(f"  {s:>{col_w}s}" for s in short) + f"  {'PD_acc':>13s}  {'Mean_r':>13s}"
-    div    = "=" * len(header)
+    night_set  = set(NIGHT_RX)
+    day_cols   = [c for c in CONT_RX if c not in night_set]
+    night_cols = [c for c in CONT_RX if c in     night_set]
+    n_apd_val  = int((va["night time PD"].values > 0).sum())
+
+    short   = [col[:8] for col in CONT_RX]
+    col_w   = 9
+    header  = (f"{'Model':18s}"
+               + "".join(f"  {s:>{col_w}s}" for s in short)
+               + f"  {'PD_acc':>7s}"
+               + f"  {'Day_r':>7s}"
+               + f"  {'Ngt_r(APD)':>12s}"
+               + f"  {'tr_Day':>7s}")
+    div = "=" * len(header)
     print(f"\n{div}")
+    title = "STAGE A COMPARISON — val-set Pearson"
     if n_runs > 1:
-        print(f"STAGE A COMPARISON — val-set Pearson  mean±std over {n_runs} seeds")
-    else:
-        print("STAGE A COMPARISON — val-set Pearson")
+        title += f"  mean±std over {n_runs} seeds"
+    title += f"  |  nighttime cols evaluated on {n_apd_val} APD val patients"
+    print(title)
     print(header)
     print("-" * len(header))
 
     for model_type in STAGE_A_TYPES:
         runs = all_results[model_type]
         if not runs:
-            print(f"{model_type:15s}  ERROR (all runs failed)")
+            print(f"{model_type:18s}  ERROR (all runs failed)")
             continue
-        row = f"{model_type:15s}"
-        pearson_means = []
+        row = f"{model_type:18s}"
+        col_means: dict = {}
         for col in CONT_RX:
             vals = [r[col] for r in runs if col in r and not np.isnan(r[col])]
-            if vals:
-                mu, sd = float(np.mean(vals)), float(np.std(vals))
-                cell = f"{mu:.4f}±{sd:.4f}" if n_runs > 1 else f"{mu:.4f}"
-                pearson_means.append(mu)
-            else:
-                cell = "nan"
+            mu   = float(np.mean(vals)) if vals else float("nan")
+            sd   = float(np.std(vals))  if vals else float("nan")
+            col_means[col] = mu
+            cell = f"{mu:.4f}±{sd:.4f}" if n_runs > 1 else f"{mu:.4f}"
             row += f"  {cell:>{col_w}s}"
         # CAT_RX accuracy
         cat_vals = [r[CAT_RX] for r in runs if CAT_RX in r]
-        if cat_vals:
-            cmu, csd = float(np.mean(cat_vals)), float(np.std(cat_vals))
-            cat_cell = f"{cmu:.4f}±{csd:.4f}" if n_runs > 1 else f"{cmu:.4f}"
-        else:
-            cat_cell = "nan"
-        mean_r = float(np.mean(pearson_means)) if pearson_means else float("nan")
-        tr_means = [float(np.mean([r["_train"][c] for r in runs if "_train" in r and c in r["_train"]]))
-                    for c in CONT_RX]
-        tr_mean_r = float(np.mean([v for v in tr_means if not np.isnan(v)])) if tr_means else float("nan")
-        row += f"  {cat_cell:>13s}  {mean_r:>7.4f} (tr:{tr_mean_r:.4f})"
+        cmu = float(np.mean(cat_vals)) if cat_vals else float("nan")
+        row += f"  {cmu:>7.4f}"
+        # Day / Night mean
+        day_vals   = [col_means[c] for c in day_cols   if not np.isnan(col_means.get(c, float("nan")))]
+        night_vals = [col_means[c] for c in night_cols if not np.isnan(col_means.get(c, float("nan")))]
+        day_r   = float(np.mean(day_vals))   if day_vals   else float("nan")
+        night_r = float(np.mean(night_vals)) if night_vals else float("nan")
+        row += f"  {day_r:>7.4f}"
+        row += f"  {night_r:>12.4f}"
+        # Train day mean
+        tr_day_vals = []
+        for c in day_cols:
+            tv = [r["_train"][c] for r in runs if "_train" in r and c in r["_train"]
+                  and not np.isnan(r["_train"][c])]
+            if tv:
+                tr_day_vals.append(float(np.mean(tv)))
+        tr_day_r = float(np.mean(tr_day_vals)) if tr_day_vals else float("nan")
+        row += f"  {tr_day_r:>7.4f}"
         print(row)
 
     print(div)
+    print(f"\nDay_r  = mean Pearson of {day_cols} (all val patients)")
+    print(f"Ngt_r  = mean Pearson of {night_cols} (APD-only, n={n_apd_val})")
     print("\nRun `python train_f3.py --stageA <best_model>` for the full Stage A + B pipeline.")
 
 
@@ -847,6 +886,13 @@ if __name__ == "__main__":
         "--top_k", type=int, default=None, metavar="K",
         help="Select top K features via MultiTaskLasso importance before training "
              "(e.g. --top_k 25). Default: use all features.",
+    )
+    parser.add_argument(
+        "--max_visits", type=int, default=None, metavar="K",
+        help="Use at most K randomly-sampled visits per patient before aggregation "
+             "(e.g. --max_visits 3). Keeps all 334 patients but makes each patient's "
+             "feature vector noisier — closer to a real first-visit scenario. "
+             "Default: use all visits (current behaviour).",
     )
     parser.add_argument(
         "--augment", type=int, default=0, metavar="N",
