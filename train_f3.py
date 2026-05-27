@@ -323,6 +323,83 @@ def _augment_patients(df_raw: pd.DataFrame, n_augment: int = 4,
 
 
 # =============================================================================
+# Distribution plot
+# =============================================================================
+
+def plot_distributions() -> None:
+    """Plot prescription variable distributions and save to report dir.
+
+    Daytime vars  — all patients (outliers excluded).
+    Nighttime vars — APD patients only (night time PD > 0, outliers excluded).
+    Outlier removal: patients whose mean value for that variable is >3σ from
+    the population mean are excluded from that subplot.
+    """
+    print(f"[plot_dist] Loading {DATA_CSV} ...")
+    df_raw = pd.read_csv(DATA_CSV)
+    df_raw = remove_outlier_patients(df_raw)
+
+    # Patient-level aggregation so each patient contributes one point
+    cols_needed = [PATIENT_ID_COL] + [c for c in CONT_RX if c in df_raw.columns]
+    df_agg = _aggregate_patients(df_raw[cols_needed + [
+        c for c in DISCRETE_COLUMNS if c in df_raw.columns]])
+
+    night_set       = set(NIGHT_RX)
+    day_cols_plot   = [c for c in CONT_RX if c not in night_set]
+    night_cols_plot = [c for c in CONT_RX if c in     night_set]
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    fig.suptitle(
+        "Prescription variable distributions  "
+        "(patient-level aggregated, outliers excluded)\n"
+        "Nighttime vars: APD patients only (night time PD > 0)",
+        fontsize=11,
+    )
+
+    for row_i, group in enumerate([day_cols_plot, night_cols_plot]):
+        for col_i, col in enumerate(group):
+            ax = axes[row_i][col_i]
+
+            vals = df_agg[col].dropna()
+
+            if col in night_set:
+                vals = vals[vals > 0]          # APD-only for nighttime cols
+                note = "  [APD-only]"
+            else:
+                note = ""
+
+            # Remove per-column outliers (>3σ) for cleaner visualization
+            if len(vals) > 3:
+                mu, sd = float(vals.mean()), float(vals.std())
+                vals = vals[(vals >= mu - 3 * sd) & (vals <= mu + 3 * sd)]
+
+            n   = len(vals)
+            mu  = float(vals.mean())  if n > 0 else float("nan")
+            med = float(vals.median()) if n > 0 else float("nan")
+            sd  = float(vals.std())   if n > 1 else float("nan")
+
+            if n > 0:
+                ax.hist(vals, bins=min(25, max(5, n // 3)),
+                        color="steelblue", alpha=0.75, edgecolor="white")
+                ax.axvline(mu,  color="red",    lw=1.5, ls="--", label=f"mean={mu:.2f}")
+                ax.axvline(med, color="orange", lw=1.5, ls=":",  label=f"med={med:.2f}")
+
+            ax.set_title(f"{col[:24]}{note}\nn={n}  σ={sd:.2f}", fontsize=8)
+            ax.set_xlabel("value", fontsize=8)
+            ax.set_ylabel("count", fontsize=8)
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+    out = os.path.join(REPORT_DIR, "distributions.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[plot_dist] Saved → {out}")
+    print(f"  Daytime  columns: {day_cols_plot}")
+    print(f"  Nighttime columns (APD-only): {night_cols_plot}")
+
+
+# =============================================================================
 # Two-stage prediction helper
 # =============================================================================
 
@@ -914,6 +991,13 @@ if __name__ == "__main__":
              "(APD patients only). Requires --top_k to be set.",
     )
     parser.add_argument(
+        "--plot_dist", action="store_true",
+        help="Plot distributions of all prescription variables and exit. "
+             "Nighttime vars show APD patients only (night time PD > 0). "
+             "Outlier patients (>3σ) are excluded. "
+             "Saves to report_model3/distributions.png",
+    )
+    parser.add_argument(
         "--sweep_k", action="store_true",
         help="Sweep top_k values [5,10,15,20,25,30,40,50,75,all] and plot val Pearson "
              "vs k for each prescription variable. Uses --stageA model (default: lasso). "
@@ -925,7 +1009,9 @@ if __name__ == "__main__":
              "shows upper bound of hierarchical Stage A.",
     )
     args = parser.parse_args()
-    if args.sweep_k:
+    if args.plot_dist:
+        plot_distributions()
+    elif args.sweep_k:
         sweep_top_k(args)
     elif args.stageA is None:
         compare_all_stage_a(args)
